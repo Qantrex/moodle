@@ -36,9 +36,9 @@ UA = "moodle-cli (personal, read-only)"
 
 # subject code -> words that identify its courses (code itself always counts)
 SUBJECTS = {
-    "D": [r"deutsch"], "E": [r"englisch", r"english"], "GGP": [r"geschichte", r"geografie", r"geographie", r"politische"],
+    "AM": [r"angewandte mathematik", r"mathematik"], "D": [r"deutsch"], "E": [r"englisch", r"english"], "GGP": [r"geschichte", r"geografie", r"geographie", r"politische"],
     "INSY": [r"informationssysteme"], "ITP": [r"informationstechnische projekte"], "ITSI": [r"it-?sicherheit"],
-    "NAWI": [r"naturwissenschaft"], "SEW": [r"softwareentwicklung"], "SYT": [r"systemtechnik"],
+    "NAWI": [r"naturwissenschaft"], "SEW": [r"softwareentwicklung", r"(?<![a-z])sewj(?![a-z])"], "SYT": [r"systemtechnik"],
     "WIRE": [r"wirtschaft", r"recht"],
 }
 
@@ -228,7 +228,7 @@ def assignments(all_years=False, with_status=True):
         if not course:
             continue
         for x in c.get("assignments", []):
-            a = dict(id=x["id"], cmid=x["cmid"], name=x["name"].strip(), course=course.get("shortname") or course["fullname"],
+            a = dict(id=x["id"], cmid=x["cmid"], name=html.unescape(x["name"]).strip(), course=course.get("shortname") or course["fullname"],
                      subject=course["subject"], year=course["year"], due=x.get("duedate") or 0,
                      cutoff=x.get("cutoffdate") or 0, opens=x.get("allowsubmissionsfromdate") or 0,
                      intro=text_of(x.get("intro")), files=x.get("introattachments") or [],
@@ -258,6 +258,8 @@ def done(a):
 # ---- notes ----------------------------------------------------------------------------------------------------
 
 FM = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+PLACEHOLDER = re.compile(r"(?<![a-zäöü])(note|noten|notengebung|zeugnis|jahreszeugnis|schulnachricht|zwischennote|organisation)(?![a-zäöü])",
+                         re.I)                               # Moodle "assignments" that are only grade slots or info pages
 
 
 def slug(name):
@@ -362,14 +364,20 @@ def cmd_sync(a):
     items = assignments()
     have = existing_notes()
     token = read_token()
-    made = updated = skipped = 0
+    made = updated = skipped = undated = 0
     for x in items:
         if not x["subject"]:
             skipped += 1
             log("skip (no subject for course %r; add it to %s): %s" % (x["course"], SUBJECTS_FILE, x["name"]))
             continue
-        if not a.all and x["due"] and x["due"] < time.time() - a.days * 86400 and x["cmid"] not in have:
-            continue                                         # old assignments only when asked (--all)
+        if x["cmid"] not in have:
+            if PLACEHOLDER.search(x["name"]):
+                continue                                     # grade slots and organisation pages, not work
+            if not x["due"] and not a.undated:
+                undated += 1
+                continue
+            if not a.all and x["due"] and x["due"] < time.time() - a.days * 86400:
+                continue                                     # old assignments only when asked (--all)
         name = slug(x["name"])
         files_dir = os.path.join(FILES, x["subject"], name)
         saved = []
@@ -411,7 +419,8 @@ def cmd_sync(a):
         if not a.dry_run:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             open(path, "w", encoding="utf-8").write(text)
-    log("%d new, %d updated, %d skipped (no subject)%s" % (made, updated, skipped, " — dry run, nothing written" if a.dry_run else ""))
+    log("%d new, %d updated, %d skipped (no subject), %d without a due date left out (--undated)%s" % (
+        made, updated, skipped, undated, " — dry run, nothing written" if a.dry_run else ""))
 
 
 # ---- other commands -------------------------------------------------------------------------------------------
@@ -471,6 +480,7 @@ def main():
     s = sub.add_parser("sync", help="tracker notes + attachments for this year's assignments")
     s.add_argument("--days", type=int, default=30, help="skip assignments due more than N days ago (default 30)")
     s.add_argument("--all", action="store_true", help="also older ones")
+    s.add_argument("--undated", action="store_true", help="also assignments without a due date")
     s.add_argument("--no-files", action="store_true", help="don't download attachments")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(fn=cmd_sync)

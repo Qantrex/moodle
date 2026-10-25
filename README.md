@@ -21,7 +21,7 @@ The token is saved in `~/.config/moodle/token` (mode 600). To keep it in Bitward
 
 ## What sync does
 
-For each assignment in this year's courses (due in the last 30 days or later; `--all` for older ones):
+For each assignment in this year's courses that has a due date in the last 30 days or later (`--all`: older ones too, `--undated`: also ones without a due date). Moodle "assignments" that are only grade slots or info pages (Note, Zeugnis, Schulnachricht, Zwischennote, Organisation) are always left out.
 
 - **Note:** `~/Notes/School/<subject>/<Name>.md` with `type: assignment`, `subject`, `year`, `status`, `due`, `files` and `moodle: <id>`. The `due:` puts it in `School.base` and in the morning briefing.
 - **Existing note:** if a note already has `moodle: <id>`, or an unlinked tracker in the same subject has the same key words in its title, sync updates that note instead ("linked by name" in the output). It only sets `due`, `moodle`, `updated` and `status: done` once submitted, and it rewrites the `<!-- moodle -->` block. Everything else in the note stays mine.
