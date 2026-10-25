@@ -89,9 +89,10 @@ def cmd_token(a):
         SITE, passport)
     print("1. Log in to Moodle in your browser as usual (TGM Single Sign On).\n"
           "2. In the same browser, open:\n\n   %s\n\n"
-          "3. The browser tries to open a moodlemobile:// link. Cancel that dialog, then press F12 → Network, find the\n"
-          "   launch.php request and copy its 'Location' (moodlemobile://token=…). Chrome also lists it under\n"
-          "   chrome://net-export if Network missed it.\n"
+          "3. The browser tries to open a moodlemobile:// link. Cancel that dialog. Open DevTools (F12) → Network\n"
+          "   (reload the link if the list is empty). Pick the LAST launch.php request, the one ending in '&confirmed'\n"
+          "   with status 302, and copy the value of its 'location' response header (moodlemobile://token=…).\n"
+          "   Paste it only here, not in a chat: it works like a password for your Moodle account.\n"
           "   Or: if %s/user/managetoken.php shows a 'Moodle mobile web service' key, copy that key.\n" % (url, SITE))
     raw = getpass.getpass("4. Paste the link or the key (hidden): ")
     token = parse_token(raw, passport)

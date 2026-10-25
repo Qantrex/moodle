@@ -15,7 +15,7 @@ It's read-only towards Moodle: it never submits, uploads or changes anything the
 
 ## Getting the token
 
-`moodle token` prints a link. Log in to Moodle in Chrome as usual, then open that link. Moodle answers with a `moodlemobile://token=…` link that the browser can't open. Cancel the dialog, copy the link from DevTools (F12 → Network → the `launch.php` request → `Location` header) and paste it when the command asks. Run `moodle token` in a normal terminal, since the input is hidden.
+`moodle token` prints a link. Log in to Moodle in Chrome as usual, then open that link. Moodle answers with a `moodlemobile://token=…` link that the browser can't open. Cancel the dialog, open DevTools (F12 → Network), pick the **last** `launch.php` request (ending in `&confirmed`, status 302) and copy its `location` response header. Paste it when the command asks, and nowhere else: it works like a password. Run `moodle token` in a normal terminal, since the input is hidden.
 
 The token is saved in `~/.config/moodle/token` (mode 600). To keep it in Bitwarden instead, set `MOODLE_TOKEN_CMD='rbw get "TGM Moodle token"'`. If Moodle ever refuses the token, run `moodle token` again.
 
