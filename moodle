@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """moodle: my TGM Moodle assignments from the terminal, through Moodle's own web-service API (the one the app uses).
 
-  moodle token            one-time setup: get a personal token through TGM single sign-on (no password here)
-  moodle courses          enrolled courses and the subject each one maps to
-  moodle list [--all]     assignments: due date, subject, submission status
-  moodle show <link|id>   one assignment in full (description, attachments, submission, grade)
-  moodle sync             tracker notes in ~/Notes/School/<subject>/ + attachments in ~/Documents/Schule/<subject>/
+  moodle token                one-time setup: get a personal token through TGM single sign-on (no password here)
+  moodle courses              enrolled courses and the subject each one maps to
+  moodle list [--all]         open assignments (dated + undated): due date, subject, submission status
+  moodle show <link|id>       one assignment in full (description, attachments, submission, grade, feedback)
+  moodle add <link|id> [...]  set up ~/Notes/School/<subject>/<Task Name>/ + ~/Documents/Schule/<subject>/<Task Name>/
+  moodle sync                 refresh existing tracker notes in ~/Notes/School/ (never bulk-creates folders)
 
 Read-only towards Moodle: it never submits, uploads or changes anything there.
 """
@@ -14,6 +15,7 @@ import base64
 import getpass
 import hashlib
 import html
+import html.parser
 import json
 import os
 import re
@@ -24,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
 SITE = os.environ.get("MOODLE_URL", "https://elearning.tgm.ac.at").rstrip("/")
@@ -36,11 +39,18 @@ UA = "moodle-cli (personal, read-only)"
 
 # subject code -> words that identify its courses (code itself always counts)
 SUBJECTS = {
-    "AM": [r"angewandte mathematik", r"mathematik"], "D": [r"deutsch"], "E": [r"englisch", r"english"], "GGP": [r"geschichte", r"geografie", r"geographie", r"politische"],
+    "AM": [r"angewandte mathematik", r"mathematik"], "D": [r"deutsch"], "E": [r"englisch", r"english"],
+    "GGP": [r"geschichte", r"geografie", r"geographie", r"politische"],
     "INSY": [r"informationssysteme"], "ITP": [r"informationstechnische projekte"], "ITSI": [r"it-?sicherheit"],
-    "NAWI": [r"naturwissenschaft"], "SEW": [r"softwareentwicklung", r"(?<![a-z])sewj(?![a-z])"], "SYT": [r"systemtechnik"],
-    "WIRE": [r"wirtschaft", r"recht"],
+    "NAWI": [r"naturwissenschaft"], "SEW": [r"softwareentwicklung", r"(?<![a-z])sewj(?![a-z])"],
+    "SYT": [r"systemtechnik"], "WIRE": [r"wirtschaft", r"recht"],
 }
+
+_token_cache = None
+
+
+class MoodleError(Exception):
+    pass
 
 
 def log(*a):
@@ -54,14 +64,19 @@ def fail(msg):
 # ---- token ----------------------------------------------------------------------------------------------------
 
 def read_token():
+    global _token_cache
+    if _token_cache:
+        return _token_cache
     cmd = os.environ.get("MOODLE_TOKEN_CMD")                 # e.g. 'rbw get "TGM Moodle token"'
     if cmd:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
+            _token_cache = r.stdout.strip()
+            return _token_cache
         fail("MOODLE_TOKEN_CMD failed")
     try:
-        return open(TOKEN_FILE).read().strip()
+        _token_cache = open(TOKEN_FILE).read().strip()
+        return _token_cache
     except OSError:
         fail("no token yet: run `moodle token` once (in a normal terminal)")
 
@@ -127,20 +142,22 @@ def call(fn, token=None, **args):
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                out = json.loads(r.read().decode("utf-8"))
+                raw = r.read().decode("utf-8", "replace")
+            out = json.loads(raw)
             break
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as e:
             if attempt == 2:
                 fail("can't reach %s: %s" % (SITE, e))
             time.sleep(3 * (attempt + 1))
     if isinstance(out, dict) and out.get("exception"):
-        if out.get("errorcode") in ("invalidtoken", "accessexception"):
-            fail("Moodle refused the token (%s). Run `moodle token` again." % out.get("errorcode"))
-        fail("%s: %s" % (fn, out.get("message") or out.get("errorcode")))
+        code = out.get("errorcode") or ""
+        if code == "invalidtoken" or (code == "accessexception" and fn.startswith("core_")):
+            fail("Moodle refused the token (%s). Run `moodle token` again." % code)
+        raise MoodleError("%s: %s" % (fn, out.get("message") or code))
     return out
 
 
-def download(url, dest, token):
+def download(url, dest, token, mtime=None):
     sep = "&" if "?" in url else "?"
     req = urllib.request.Request(url + sep + "token=" + token, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -148,7 +165,276 @@ def download(url, dest, token):
     if body[:1] == b"{" and b'"errorcode"' in body[:200]:
         raise OSError(json.loads(body).get("message", "download refused"))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    open(dest, "wb").write(body)
+    tmp = dest + ".part"
+    with open(tmp, "wb") as f:
+        f.write(body)
+    os.replace(tmp, dest)
+    if mtime:
+        try:
+            os.utime(dest, (mtime, mtime))
+        except OSError:
+            pass
+
+
+# ---- HTML -> Markdown -----------------------------------------------------------------------------------------
+
+HTML_TAGS = {
+    "a", "abbr", "address", "article", "aside", "audio", "b", "bdi", "bdo", "blockquote", "body", "br", "button",
+    "caption", "cite", "code", "col", "colgroup", "data", "dd", "del", "details", "dfn", "div", "dl", "dt", "em",
+    "figcaption", "figure", "footer", "font", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "html",
+    "i", "iframe", "img", "ins", "kbd", "label", "li", "main", "mark", "meta", "nav", "ol", "p", "picture", "pre",
+    "q", "rp", "rt", "ruby", "s", "samp", "script", "section", "small", "source", "span", "strike", "strong",
+    "style", "sub", "summary", "sup", "table", "tbody", "td", "tfoot", "th", "thead", "time", "title", "tr", "u",
+    "ul", "var", "video", "wbr",
+}
+
+
+def browser_url(u):
+    """Turn token-gated /webservice/pluginfile.php links into regular SSO /pluginfile.php links."""
+    u = (u or "").strip()
+    return u.replace(SITE + "/webservice/pluginfile.php/", SITE + "/pluginfile.php/")
+
+
+class _MDParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out = []
+        self.skip = 0
+        self.pre = 0
+        self.code = 0
+        self.lists = []          # [["ul", 0], ["ol", 2], ...]
+        self.in_li = 0
+        self.li_has_text = False
+        self.links = []          # [(href, start_idx)]
+        self.marks = []          # [(marker, start_idx, active)]
+        self.table = None        # rows: [[cell_str, ...], ...]
+        self.cell = None         # list of chunks when inside td/th
+
+    def _buf(self):
+        return self.cell if self.cell is not None else self.out
+
+    def _emit(self, s):
+        if not self.skip and s:
+            self._buf().append(s)
+
+    def _tail(self):
+        b = self._buf()
+        return "".join(b[-4:]) if b else ""
+
+    def _nl(self, n=1):
+        b = self._buf()
+        if self.skip or self.cell is not None:
+            if self.cell is not None and self.cell:
+                self.cell.append(" ")
+            return
+        while b and b[-1] in (" ", "\t"):
+            b.pop()
+        if not b or not any(x.strip() for x in b):
+            return
+        t = self._tail()
+        have = len(t) - len(t.rstrip("\n"))
+        if have < n:
+            self._emit("\n" * (n - have))
+
+    def _open_mark(self, marker):
+        active = not any(m == marker and act for m, _, act in self.marks)
+        self.marks.append((marker, len(self._buf()), active))
+
+    def _close_mark(self, marker):
+        b = self._buf()
+        for idx in range(len(self.marks) - 1, -1, -1):
+            if self.marks[idx][0] == marker:
+                _, start, active = self.marks.pop(idx)
+                if not active:
+                    return
+                inner = "".join(b[start:])
+                del b[start:]
+                core = inner.strip()
+                if not core:
+                    b.append(inner)
+                else:
+                    lead = inner[:len(inner) - len(inner.lstrip())]
+                    trail = inner[len(inner.rstrip()):]
+                    b.append("%s%s%s%s" % (lead, marker, core, marker + trail))
+                return
+
+    def handle_startendtag(self, tag, attrs):
+        if tag.lower() not in HTML_TAGS:
+            raw = self.get_starttag_text() or ("<%s/>" % tag)
+            self._emit(raw if (self.pre or self.code) else "\\" + raw)
+        else:
+            super().handle_startendtag(tag, attrs)
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t not in HTML_TAGS:
+            raw = self.get_starttag_text() or ("<%s>" % tag)
+            self._emit(raw if (self.pre or self.code) else "\\" + raw)
+            return
+        at = dict(attrs)
+        if t in ("script", "style"):
+            self.skip += 1
+        elif t == "br":
+            if self.cell is not None:
+                self._emit(" ")
+            else:
+                self._emit("\n")
+        elif t == "hr":
+            self._nl(2)
+            self._emit("---\n\n")
+        elif t in ("p", "div", "blockquote"):
+            if self.in_li and not self.li_has_text:
+                pass
+            elif self.in_li:
+                self._nl(1)
+                self._emit("  " * len(self.lists))
+            else:
+                self._nl(2)
+            if t == "blockquote" and self.cell is None:
+                self._emit("> ")
+        elif t in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._nl(2)
+            self._open_mark("**")
+        elif t in ("strong", "b"):
+            if not self.pre:
+                self._open_mark("**")
+        elif t in ("em", "i"):
+            if not self.pre:
+                self._open_mark("*")
+        elif t == "pre":
+            if self.cell is not None:
+                self._open_mark("`")
+            else:
+                self._nl(2)
+                self._emit("```\n")
+            self.pre += 1
+        elif t == "code":
+            if not self.pre:
+                self.code += 1
+                self._open_mark("`")
+        elif t in ("ul", "ol"):
+            self._nl(1 if self.lists else 2)
+            self.lists.append([t, 0])
+        elif t == "li":
+            self._nl(1)
+            if not self.lists:
+                self.lists.append(["ul", 0])
+            self.lists[-1][1] += 1
+            kind, num = self.lists[-1]
+            indent = "  " * (len(self.lists) - 1)
+            self._emit("%s%s" % (indent, ("%d. " % num) if kind == "ol" else "- "))
+            self.in_li += 1
+            self.li_has_text = False
+        elif t == "a":
+            self.links.append((browser_url(at.get("href")), len(self._buf())))
+        elif t == "img":
+            src = browser_url(at.get("src"))
+            alt = (at.get("alt") or "").strip()
+            if src:
+                self._emit("![%s](%s)" % (alt, src))
+        elif t == "table":
+            if self.table is None:
+                self._nl(2)
+                self.table = []
+        elif t == "tr":
+            if self.table is not None:
+                self.table.append([])
+        elif t in ("td", "th"):
+            if self.table is not None and self.table:
+                self.cell = []
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t not in HTML_TAGS:
+            self._emit(("</%s>" if (self.pre or self.code) else r"\</%s>") % tag)
+            return
+        if t in ("script", "style"):
+            self.skip = max(0, self.skip - 1)
+        elif t in ("p", "div", "blockquote"):
+            if not self.in_li:
+                self._nl(2)
+        elif t in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._close_mark("**")
+            self._nl(2)
+        elif t in ("strong", "b"):
+            if not self.pre:
+                self._close_mark("**")
+        elif t in ("em", "i"):
+            if not self.pre:
+                self._close_mark("*")
+        elif t == "pre":
+            self.pre = max(0, self.pre - 1)
+            if self.cell is not None:
+                self._close_mark("`")
+            else:
+                if not self._tail().endswith("\n"):
+                    self._emit("\n")
+                self._emit("```\n\n")
+        elif t == "code":
+            if not self.pre and self.code:
+                self.code -= 1
+                self._close_mark("`")
+        elif t in ("ul", "ol"):
+            if self.lists:
+                self.lists.pop()
+            self._nl(1 if self.lists else 2)
+        elif t == "li":
+            self.in_li = max(0, self.in_li - 1)
+            self._nl(1)
+        elif t == "a":
+            if self.links:
+                href, start = self.links.pop()
+                b = self._buf()
+                label = "".join(b[start:]).strip()
+                del b[start:]
+                if not href or href.startswith(("javascript:", "#")):
+                    b.append(label)
+                elif not label or label == href:
+                    b.append(href)
+                else:
+                    b.append("[%s](%s)" % (label, href))
+        elif t in ("td", "th"):
+            if self.cell is not None and self.table:
+                txt = re.sub(r"\s+", " ", "".join(self.cell)).strip().replace("|", r"\|")
+                self.table[-1].append(txt)
+                self.cell = None
+        elif t == "table":
+            if self.table is not None:
+                rows = [r for r in self.table if any(r)]
+                self.table = None
+                if rows:
+                    cols = max(len(r) for r in rows)
+                    rows = [r + [""] * (cols - len(r)) for r in rows]
+                    lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * cols]
+                    lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+                    self._emit("\n".join(lines) + "\n\n")
+
+    def handle_data(self, data):
+        if self.skip or not data:
+            return
+        s = data.replace("\r\n", "\n").replace("\r", "\n")
+        if not self.pre:
+            s = s.replace("\xa0", " ")
+            s = re.sub(r"[ \t\n]+", " ", s)
+            if self._tail().endswith(("\n", "- ", ". ")) and not self.marks and not self.links:
+                s = s.lstrip(" ")
+            if not self.code:
+                s = re.sub(r"<(?=[A-Za-z/!])(?!https?://|mailto:)", r"\<", s)
+        if s.strip() and self.in_li:
+            self.li_has_text = True
+        self._emit(s)
+
+
+def text_of(htm):
+    """Convert Moodle HTML into clean Markdown while preserving links, formatting and non-HTML <placeholders>."""
+    if not htm:
+        return ""
+    p = _MDParser()
+    p.feed(htm)
+    p.close()
+    s = "".join(p.out)
+    lines = [line.rstrip(" \t") for line in s.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 # ---- data -----------------------------------------------------------------------------------------------------
@@ -195,26 +481,76 @@ def courses(all_years=False):
     return out
 
 
-def text_of(htm):
-    s = re.sub(r"<br\s*/?>|</p>|</li>|</h\d>", "\n", htm or "")
-    s = re.sub(r"<li[^>]*>", "- ", s)
-    s = html.unescape(re.sub(r"<[^>]+>", "", s))
-    return re.sub(r"\n\s*\n+", "\n\n", re.sub(r"[ \t]+", " ", s)).strip()
+def merge_files(*lists):
+    seen, out = set(), []
+    for lst in lists:
+        for f in lst or []:
+            if not isinstance(f, dict) or not f.get("filename") or not f.get("fileurl"):
+                continue
+            key = (os.path.basename(f["filename"]), f["fileurl"])
+            if key not in seen:
+                seen.add(key)
+                out.append(f)
+    return out
 
 
-def status_of(assign_id):
+def submissions_enabled_in_configs(configs):
+    if not configs:
+        return True
+    return any(
+        c.get("subtype") == "assignsubmission" and c.get("name") == "enabled" and str(c.get("value")) == "1"
+        and c.get("plugin") != "comments"
+        for c in configs
+    )
+
+
+def status_of(assign_id, subs_enabled=True):
     try:
         s = call("mod_assign_get_submission_status", assignid=assign_id)
-    except SystemExit:
-        return {"state": "?", "grade": None, "graded": False}
+    except MoodleError as e:
+        log("  note: status unavailable for assign %d (%s)" % (assign_id, e))
+        return {"state": "?" if subs_enabled else "none", "graded": False, "grade": None,
+                "feedback": "", "files": [], "activity": ""}
     last = s.get("lastattempt") or {}
+    enabled = subs_enabled and bool(last.get("submissionsenabled", True))
     sub = (last.get("teamsubmission") or last.get("submission") or {})
+    raw_state = sub.get("status")
+    if raw_state in ("submitted", "reopened"):
+        state = raw_state
+    elif not enabled:
+        state = "none"
+    else:
+        state = raw_state or "new"
     fb = s.get("feedback") or {}
-    return {"state": sub.get("status") or ("none" if not last.get("submissionsenabled", True) else "new"),
-            "graded": last.get("gradingstatus") == "graded",
-            "grade": fb.get("gradefordisplay") and text_of(fb["gradefordisplay"]),
-            "files": ((s.get("assignmentdata") or {}).get("attachments") or {}).get("intro") or [],
-            "activity": text_of((s.get("assignmentdata") or {}).get("activity") or "")}
+    comments = []
+    for p in fb.get("plugins") or []:
+        if p.get("type") == "comments":
+            for ef in p.get("editorfields") or []:
+                t = text_of(ef.get("text"))
+                if t:
+                    comments.append(t)
+    att = ((s.get("assignmentdata") or {}).get("attachments") or {})
+    return {
+        "state": state,
+        "graded": last.get("gradingstatus") == "graded",
+        "grade": fb.get("gradefordisplay") and text_of(fb["gradefordisplay"]),
+        "feedback": "\n\n".join(comments),
+        "files": merge_files(att.get("intro"), att.get("activity")),
+        "activity": text_of((s.get("assignmentdata") or {}).get("activity") or ""),
+    }
+
+
+def enrich_status(items):
+    if not items:
+        return items
+    read_token()                                                # warm token cache before spawning threads
+    with ThreadPoolExecutor(max_workers=min(6, len(items))) as ex:
+        sts = list(ex.map(lambda a: status_of(a["id"], a["subs_enabled"]), items))
+    for a, st in zip(items, sts):
+        a.update(state=st["state"], graded=st["graded"], grade=st["grade"],
+                 feedback=st["feedback"], activity=st["activity"],
+                 files=merge_files(a["files"], st["files"]))
+    return items
 
 
 def assignments(all_years=False, with_status=True):
@@ -228,18 +564,21 @@ def assignments(all_years=False, with_status=True):
         if not course:
             continue
         for x in c.get("assignments", []):
-            a = dict(id=x["id"], cmid=x["cmid"], name=html.unescape(x["name"]).strip(), course=course.get("shortname") or course["fullname"],
-                     subject=course["subject"], year=course["year"], due=x.get("duedate") or 0,
-                     cutoff=x.get("cutoffdate") or 0, opens=x.get("allowsubmissionsfromdate") or 0,
-                     intro=text_of(x.get("intro")), files=x.get("introattachments") or [],
-                     url="%s/mod/assign/view.php?id=%d" % (SITE, x["cmid"]))
-            if with_status:
-                st = status_of(x["id"])
-                a.update(state=st["state"], graded=st["graded"], grade=st["grade"], activity=st["activity"])
-                if not a["files"]:
-                    a["files"] = st["files"]
-            out.append(a)
-    out.sort(key=lambda a: (a["due"] == 0, a["due"]))
+            clean_name = re.sub(r"\s+", " ", html.unescape(x["name"]).replace("\xa0", " ")).strip()
+            out.append(dict(
+                id=x["id"], cmid=x["cmid"], name=clean_name,
+                course=course.get("shortname") or course["fullname"],
+                subject=course["subject"], year=course["year"],
+                due=x.get("duedate") or 0, cutoff=x.get("cutoffdate") or 0,
+                opens=x.get("allowsubmissionsfromdate") or 0,
+                subs_enabled=submissions_enabled_in_configs(x.get("configs")),
+                intro=text_of(x.get("intro")),
+                files=merge_files(x.get("introattachments"), x.get("introfiles")),
+                url="%s/mod/assign/view.php?id=%d" % (SITE, x["cmid"]),
+            ))
+    out.sort(key=lambda a: (a["due"] == 0, a["due"], a["subject"] or "", a["name"]))
+    if with_status:
+        enrich_status(out)
     return out
 
 
@@ -251,34 +590,98 @@ def when(ts):
     return datetime.fromtimestamp(ts).strftime("%a %d.%m.%Y %H:%M") if ts else "no due date"
 
 
+FAIL_GRADE = re.compile(
+    r"(?<![a-zäöü])(nicht\s+erbracht|nicht\s+vollst|unvollst|nicht\s+genügend|ungenügend|fail|fehlt)(?![a-zäöü])"
+    r"|\A\s*[-–]\s*\Z|\A\s*0+(?:[.,]0+)?\s*(?:\(|%|\Z)",
+    re.I,
+)
+
+
 def done(a):
-    return a.get("state") == "submitted" or a.get("graded")
+    if a.get("state") == "reopened":
+        return False
+    if a.get("state") == "submitted":
+        return True
+    return bool(a.get("graded") and a.get("grade") and not FAIL_GRADE.search(a["grade"]))
 
 
-# ---- notes ----------------------------------------------------------------------------------------------------
+# ---- notes & folders ------------------------------------------------------------------------------------------
 
 FM = re.compile(r"\A---\n(.*?)\n---\n", re.S)
-PLACEHOLDER = re.compile(r"(?<![a-zäöü])(note|noten|notengebung|zeugnis|jahreszeugnis|schulnachricht|zwischennote|organisation)(?![a-zäöü])",
-                         re.I)                               # Moodle "assignments" that are only grade slots or info pages
+PLACEHOLDER = re.compile(
+    r"(?<![a-zäöü])(note|noten|notengebung|zeugnis|jahreszeugnis|schulnachricht|zwischennote|organisation"
+    r"|mitarbeitsbewertung|semesterprüfung|übungs\s+mrdp)(?![a-zäöü])"
+    r"|bewertung\s+\d|absolvierung\s+modul|aktives\s+engagement.*wettbewerb|\(optional\)\s*github\s+username",
+    re.I,
+)                                                               # Moodle "assignments" that are only grade slots or admin pages
+TEST_NAME = re.compile(
+    r"(?<![a-zäöü])(lernfortschrittskontrolle|schularbeit|mock\s+exam|w@test|lr@test|test|prüfung|klausur)(?![a-zäöü])",
+    re.I,
+)
+AUTO_TODO = re.compile(
+    r"^> - \[([ x])\] (?:(?:Hand in by|Complete by|Exam / check on) \*\*[^*]+\*\*|"
+    r"(?:Hand in|Exam / check) \(no due date in Moodle\))\.[ \t]*$",
+    re.M,
+)
+TEMPLATE_TODO = re.compile(
+    r"^(> - \[) (\] Add the due date \(Classroom50 / Moodle\) and check the status\.)[ \t]*$",
+    re.M,
+)
 
 
-def slug(name):
-    s = re.sub(r"[^\w\s-]", "", name, flags=re.U).strip()
-    return re.sub(r"[\s_]+", "-", s)[:70].strip("-") or "Assignment"
+def task_name(name):
+    """Exact task name, sanitizing only bytes forbidden by Linux paths or Obsidian LiveSync (\\/:*?\"<>|#)."""
+    s = re.sub(r"[\x00-\x1f]+", "", name)
+    s = re.sub(r"\s*:\s*", " - ", s).replace('"', "'").replace("/", "-")
+    s = re.sub(r"[\\?<>|*#]+", "", s)
+    s = re.sub(r"  +", " ", s).strip()
+    return s if s not in ("", ".", "..") else "Assignment"
+
+
+def kind_of(a):
+    return "test" if TEST_NAME.search(a["name"]) else "assignment"
+
+
+def yaml_val(v):
+    s = str("" if v is None else v)
+    if not s:
+        return ""
+    if (": " in s or " #" in s or s.endswith(":") or any(c in s for c in '"\\\n\r\t')
+            or s[0] in "[{*&!|>%@`?'\"-"):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def unquote_yaml(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        inner = s[1:-1]
+        return inner.replace('\\"', '"').replace("\\\\", "\\") if s[0] == '"' else inner.replace("''", "'")
+    return s
 
 
 def props_of(text):
     m = FM.match(text)
-    return dict(re.findall(r"^([\w-]+):[ \t]*(.*?)[ \t]*$", m.group(1), re.M)) if m else {}
+    if not m:
+        return {}
+    return {k: unquote_yaml(v) for k, v in re.findall(r"^([\w-]+):[ \t]*(.*?)[ \t]*$", m.group(1), re.M)}
+
+
+def yaml_line(key, value):
+    val = yaml_val(value)
+    return "%s: %s" % (key, val) if val != "" else "%s:" % key
 
 
 def set_prop(text, key, value):
+    line = yaml_line(key, value)
     m = FM.match(text)
+    if not m:
+        return "---\n%s\n---\n" % line + text
     fm = m.group(1)
     if re.search(r"^%s:.*$" % re.escape(key), fm, re.M):
-        fm = re.sub(r"^%s:.*$" % re.escape(key), "%s: %s" % (key, value), fm, count=1, flags=re.M)
+        fm = re.sub(r"^%s:.*$" % re.escape(key), lambda _: line, fm, count=1, flags=re.M)
     else:
-        fm += "\n%s: %s" % (key, value)
+        fm += "\n" + line
     return "---\n" + fm + "\n---\n" + text[m.end():]
 
 
@@ -290,10 +693,19 @@ def put_block(text, content):
     return text.rstrip() + "\n\n" + block + "\n"
 
 
+def strip_volatile(text):
+    t = re.sub(r"^updated:[ \t]*.*$", "updated:", text, count=1, flags=re.M)
+    return re.sub(r"^\*synced [^*]+ by `moodle`; edit outside this block\*$"
+                  r"|^\*synced [^*]+ by `moodle sync`; edit outside this block\*$", "*synced*", t, count=1, flags=re.M)
+
+
 def existing_notes():
     """cmid -> note path, for notes that already carry `moodle: <cmid>`."""
     out = {}
-    for d, _, fs in os.walk(NOTES):
+    if not os.path.isdir(NOTES):
+        return out
+    for d, dirs, fs in os.walk(NOTES):
+        dirs[:] = [x for x in dirs if not x.startswith(".") and not os.path.islink(os.path.join(d, x))]
         for f in fs:
             if f.endswith(".md"):
                 p = os.path.join(d, f)
@@ -303,124 +715,394 @@ def existing_notes():
     return out
 
 
-NOISE = {"group", "gruppe", "aufgabe", "abgabe", "assignment", "task", "teil", "part", "sem09", "2627", "2526"}
+NOISE = {
+    "group", "gruppe", "aufgabe", "abgabe", "assignment", "task", "teil", "part", "übung", "uebung",
+    "sem09", "2627", "2526", "borm", "erarbeit", "erarbeiten", "wissenschaftliches", "arbeiten",
+}
+SHORT_TERMS = {"ci", "cd", "qt", "ai", "da", "vm", "db", "ui", "os", "ip"}
+SYNONYMS = {"restore": "recovery"}
 
 
 def words(s):
-    return {w for w in re.findall(r"[a-zäöüß0-9]+", s.lower()) if len(w) >= 4 and w not in NOISE
-            and w.upper() not in SUBJECTS}
+    out = set()
+    for w in re.findall(r"[a-zäöüß0-9]+", s.lower()):
+        w = SYNONYMS.get(w, w)
+        if w in NOISE or w.upper() in SUBJECTS or re.fullmatch(r"[a-z]{2,5}\d+[a-z]", w):
+            continue
+        if len(w) >= 4 or w in SHORT_TERMS:
+            out.add(w)
+    return out
+
+
+def candidate_tracker_notes(subject_dir, linked):
+    if not os.path.isdir(subject_dir):
+        return
+    for entry in sorted(os.listdir(subject_dir)):
+        if entry.startswith("."):
+            continue
+        p = os.path.join(subject_dir, entry)
+        if os.path.islink(p):
+            continue
+        if os.path.isfile(p) and entry.endswith(".md") and p not in linked:
+            yield p
+        elif os.path.isdir(p):
+            for sub in sorted(os.listdir(p)):
+                sp = os.path.join(p, sub)
+                if sub.endswith(".md") and sub != "TASK.md" and os.path.isfile(sp) and not os.path.islink(sp) and sp not in linked:
+                    yield sp
 
 
 def match_by_name(a, linked):
-    """An existing tracker note in the same subject (not yet linked to Moodle) whose title shares the key words."""
-    folder = os.path.join(NOTES, a["subject"])
-    want, best = words(a["name"]), None
-    if not want or not os.path.isdir(folder):
+    """An existing tracker note in the same subject (not yet linked to Moodle) whose title or repo matches."""
+    if not a["subject"]:
         return None
-    for f in os.listdir(folder):
-        p = os.path.join(folder, f)
-        if not f.endswith(".md") or p in linked:
-            continue
+    folder = os.path.join(NOTES, a["subject"])
+    want = words(a["name"])
+    is_ek = bool(re.search(r"(?<![a-z])ek\d*(?![a-z])", a["name"].lower()))
+    body = "%s\n%s" % (a.get("intro") or "", a.get("activity") or "")
+    c50 = {s.lower() for s in re.findall(r"classroom50\.org/[^\s)\"'>]+/assignments/([a-z0-9_-]+)", body, re.I)}
+    best = None
+    for p in candidate_tracker_notes(folder, linked):
         text = open(p, encoding="utf-8").read()
         pr = props_of(text)
         if pr.get("moodle") or pr.get("type") not in ("assignment", "test"):
             continue
+        stem = os.path.basename(p)[:-3]
+        files_base = os.path.basename(pr.get("files", "")).lower()
+        slug_hit = any(s in files_base or s in stem.lower() for s in c50)
         h1 = re.search(r"^# (.+)$", text, re.M)
-        have = words(f[:-3] + " " + (h1.group(1) if h1 else ""))
+        note_title = "%s %s" % (stem, h1.group(1) if h1 else "")
+        note_ek = bool(re.search(r"(?<![a-z])ek\d*(?![a-z])", note_title.lower()))
+        if is_ek != note_ek and not slug_hit:
+            continue
+        have = words("%s %s" % (note_title, files_base))
         shared = len(want & have)
-        if shared >= 2 or (shared and shared / len(want | have) >= 0.5):
-            if not best or shared > best[0]:
-                best = (shared, p)
+        score = (10 + shared) if slug_hit else shared
+        if slug_hit or (want and (shared >= 2 or (shared and shared / len(want | have) >= 0.5))):
+            if not best or score > best[0]:
+                best = (score, p)
     return best and best[1]
 
 
-def block_for(a, files_dir, saved):
-    lines = ["## Moodle", "", "*synced %s by `moodle sync`; edit outside this block*" % datetime.now().strftime("%Y-%m-%d %H:%M"), "",
+def md_file_link(path):
+    label = os.path.basename(path).replace("[", r"\[").replace("]", r"\]")
+    return "[%s](file://%s)" % (label, urllib.parse.quote(path, safe="/:@"))
+
+
+def extra_instructions(a):
+    act = (a.get("activity") or "").strip()
+    return act if act and act != (a.get("intro") or "").strip() else ""
+
+
+def task_md_for(a):
+    lines = ["<!-- moodle -->", "# %s" % heading_for(a), "",
+             "- **Task:** %s" % a["name"],
+             "- **Course:** %s" % a["course"],
+             "- **Moodle:** %s" % a["url"],
+             "- **Due:** %s" % when(a["due"])]
+    if a["cutoff"] and a["cutoff"] != a["due"]:
+        lines.append("- **Last chance (cut-off):** %s" % when(a["cutoff"]))
+    if a["opens"] and a["opens"] > time.time():
+        lines.append("- **Opens:** %s" % when(a["opens"]))
+    if a["intro"]:
+        lines += ["", "## Task", "", a["intro"]]
+    act = extra_instructions(a)
+    if act:
+        lines += ["", "## Instructions", "", act]
+    if not a["intro"] and not act:
+        lines += ["", "*(No task description in Moodle.)*"]
+    return "\n".join(lines) + "\n"
+
+
+def block_for(a, dl_dir, saved, has_task_md=False):
+    lines = ["## Moodle", "",
+             "*synced %s by `moodle sync`; edit outside this block*" % datetime.now().strftime("%Y-%m-%d %H:%M"), "",
              "- **Link:** %s" % a["url"], "- **Course:** %s" % a["course"], "- **Due:** %s" % when(a["due"])]
     if a["cutoff"] and a["cutoff"] != a["due"]:
         lines.append("- **Last chance (cut-off):** %s" % when(a["cutoff"]))
     if a["opens"] and a["opens"] > time.time():
         lines.append("- **Opens:** %s" % when(a["opens"]))
-    lines.append("- **Submission:** %s%s" % (a.get("state", "?"), ", graded: %s" % a["grade"] if a.get("grade") else ""))
-    if saved:
-        lines.append("- **Files:** [%s](file://%s)" % (os.path.basename(files_dir), files_dir.replace(" ", "%20")))
+    sub_label = "no online submission" if a.get("state") == "none" else a.get("state", "?")
+    lines.append("- **Submission:** %s%s" % (sub_label, ", graded: %s" % a["grade"] if a.get("grade") else ""))
+    fb = (a.get("feedback") or "").strip()
+    if fb and "\n" not in fb and len(fb) <= 140:
+        lines.append("- **Feedback:** %s" % fb)
+    if has_task_md:
+        lines.append("- **Task:** [TASK.md](TASK.md)")
+    if dl_dir and (saved or os.path.isdir(dl_dir)):
+        lines.append("- **Files:** %s" % md_file_link(dl_dir))
         lines += ["  - %s" % s for s in saved]
-    if a["intro"]:
-        lines += ["", "### Task", "", a["intro"]]
-    if a.get("activity"):
-        lines += ["", "### Instructions", "", a["activity"]]
+    if fb and ("\n" in fb or len(fb) > 140):
+        lines += ["", "### Feedback", "", fb]
+    if not has_task_md:
+        if a["intro"]:
+            lines += ["", "### Task", "", a["intro"]]
+        act = extra_instructions(a)
+        if act:
+            lines += ["", "### Instructions", "", act]
     return "\n".join(lines)
 
 
+def heading_for(a):
+    clean = re.sub(r"  +", " ", re.sub(r"\s*:\s*", " ", a["name"])).strip()
+    if re.match(r"^%s\b" % re.escape(a["subject"]), clean, re.I):
+        return clean
+    return "%s — %s" % (a["subject"], clean)
+
+
+def todo_for(a):
+    mark = "x" if done(a) else " "
+    kind = kind_of(a)
+    verb = "Exam / check on" if kind == "test" else ("Complete by" if a.get("state") == "none" else "Hand in by")
+    if a["due"]:
+        return "> - [%s] %s **%s**." % (mark, verb, when(a["due"]))
+    return "> - [%s] %s (no due date in Moodle)." % (mark, "Exam / check" if kind == "test" else "Hand in")
+
+
+def sync_auto_todo(text, a):
+    """Keep auto-generated todo checkboxes and due dates in sync without touching custom user todos."""
+    def repl(m):
+        line = todo_for(a)
+        if m.group(1) == "x" and not done(a):
+            line = line.replace("> - [ ] ", "> - [x] ", 1)
+        return line
+    text = AUTO_TODO.sub(repl, text, count=1)
+    if done(a):
+        text = TEMPLATE_TODO.sub(r"\1x\2", text, count=1)
+    return text
+
+
 def new_note(a, files_dir):
-    title = "%s: %s" % (a["subject"], a["name"])
-    todo = "> - [ ] Hand in by **%s**." % when(a["due"]) if a["due"] else "> - [ ] Hand in (no due date in Moodle)."
-    return ("---\ntype: assignment\nsubject: %s\nyear: %s\nstatus: %s\ndue: %s\nfiles: %s\nmoodle: %d\nupdated: %s\n---\n"
-            "# %s\n\n> [!todo]\n%s\n" % (a["subject"], a["year"], "done" if done(a) else "open", day(a["due"]),
-                                        files_dir, a["cmid"], date.today().isoformat(), title, todo))
+    fm = "\n".join([
+        yaml_line("type", kind_of(a)),
+        yaml_line("subject", a["subject"]),
+        yaml_line("year", a["year"]),
+        yaml_line("status", "done" if done(a) else "open"),
+        yaml_line("due", day(a["due"])),
+        yaml_line("files", files_dir),
+        yaml_line("moodle", a["cmid"]),
+        yaml_line("updated", date.today().isoformat()),
+    ])
+    return "---\n%s\n---\n# %s\n\n> [!todo]\n%s\n" % (fm, heading_for(a), todo_for(a))
 
 
-def cmd_sync(a):
-    items = assignments()
-    have = existing_notes()
-    token = read_token()
-    made = updated = skipped = undated = 0
-    for x in items:
-        if not x["subject"]:
-            skipped += 1
-            log("skip (no subject for course %r; add it to %s): %s" % (x["course"], SUBJECTS_FILE, x["name"]))
+def needs_download(dest, f):
+    if not os.path.exists(dest):
+        return True
+    if f.get("filesize") is not None:
+        try:
+            if os.path.getsize(dest) != int(f["filesize"]):
+                return True
+        except (OSError, ValueError):
+            pass
+    if f.get("timemodified"):
+        try:
+            if int(os.path.getmtime(dest)) < int(f["timemodified"]) - 1:
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def pick_new_note_path(subject, name, cmid, claimed):
+    """~/Notes/School/<subject>/<Exact Task Name>/<Exact Task Name>.md"""
+    tname = task_name(name)
+    folder = os.path.join(NOTES, subject, tname)
+    p = os.path.join(folder, tname + ".md")
+    if p in claimed or os.path.exists(p):
+        tname = "%s (%d)" % (tname, cmid)
+        folder = os.path.join(NOTES, subject, tname)
+        p = os.path.join(folder, tname + ".md")
+    return p
+
+
+def resolve_files_dir(x, is_existing, old_props, claimed_dirs, create_work_dir=False):
+    """Return (frontmatter_files_value, attachment_download_dir)."""
+    already_finished = done(x) or old_props.get("status") in ("done", "dropped")
+    exact = os.path.join(FILES, x["subject"], task_name(x["name"]))
+    if exact in claimed_dirs:
+        exact = "%s (%d)" % (exact, x["cmid"])
+    existing_files = old_props.get("files", "").strip() if is_existing else ""
+    if existing_files:
+        in_schule = os.path.abspath(existing_files).startswith(os.path.abspath(FILES) + os.sep)
+        is_git = os.path.exists(os.path.join(existing_files, ".git"))
+        if in_schule and not is_git:
+            claimed_dirs.add(existing_files)
+            return existing_files, (existing_files if os.path.isdir(existing_files) or not already_finished else None)
+        if x["files"] and (os.path.isdir(exact) or not already_finished):
+            claimed_dirs.add(exact)
+            return existing_files, exact
+        return existing_files, None
+    if os.path.isdir(exact) or ((x["files"] or create_work_dir) and not already_finished):
+        claimed_dirs.add(exact)
+        return exact, exact
+    return "", None
+
+
+def sync_task_md(note_dir, x, dry_run):
+    """Ensure TASK.md inside the vault's assignment folder holds the exact Moodle task description."""
+    p = os.path.join(note_dir, "TASK.md")
+    if os.path.exists(p):
+        old = open(p, encoding="utf-8").read()
+        if "<!-- moodle -->" not in old:
+            return False
+    else:
+        old = None
+    content = task_md_for(x)
+    if old == content:
+        return False
+    if not dry_run:
+        os.makedirs(note_dir, exist_ok=True)
+        open(p, "w", encoding="utf-8").write(content)
+    return True
+
+
+def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=False, no_files=False, dry_run=False, how=""):
+    """Write or update one assignment's note, TASK.md and working/attachment folder. Returns 'new'|'updated'|'unchanged'."""
+    is_existing = bool(path and os.path.exists(path))
+    old_text = open(path, encoding="utf-8").read() if is_existing else ""
+    old_props = props_of(old_text) if is_existing else {}
+    if not path:
+        path = pick_new_note_path(x["subject"], x["name"], x["cmid"], claimed_notes)
+        have[x["cmid"]] = path
+        claimed_notes.add(path)
+
+    subject_root = os.path.abspath(os.path.join(NOTES, x["subject"]))
+    note_dir = os.path.abspath(os.path.dirname(path))
+    in_task_folder = note_dir != subject_root
+
+    files_prop, dl_dir = resolve_files_dir(x, is_existing, old_props, claimed_dirs,
+                                           create_work_dir=(create_work_dir and not no_files))
+    if create_work_dir and dl_dir and not no_files and not dry_run:
+        os.makedirs(dl_dir, exist_ok=True)
+
+    saved = []
+    for f in (x["files"] if dl_dir and not no_files else []):
+        fname = os.path.basename(f["filename"]).strip()
+        if not fname:
             continue
-        if x["cmid"] not in have:
-            if PLACEHOLDER.search(x["name"]):
-                continue                                     # grade slots and organisation pages, not work
-            if not x["due"] and not a.undated:
-                undated += 1
+        dest = os.path.join(dl_dir, fname)
+        if needs_download(dest, f) and not dry_run:
+            try:
+                download(f["fileurl"], dest, token, mtime=f.get("timemodified"))
+            except (OSError, urllib.error.URLError) as e:
+                log("  can't download %s: %s" % (fname, e))
                 continue
-            if not a.all and x["due"] and x["due"] < time.time() - a.days * 86400:
-                continue                                     # old assignments only when asked (--all)
-        name = slug(x["name"])
-        files_dir = os.path.join(FILES, x["subject"], name)
-        saved = []
-        for f in x["files"] if not a.no_files else []:
-            dest = os.path.join(files_dir, f["filename"])
-            if not os.path.exists(dest) and not a.dry_run:
-                try:
-                    download(f["fileurl"], dest, token)
-                except (OSError, urllib.error.URLError) as e:
-                    log("  can't download %s: %s" % (f["filename"], e))
-                    continue
-            saved.append(f["filename"])
+        saved.append(fname)
+
+    task_changed = sync_task_md(note_dir, x, dry_run) if in_task_folder else False
+
+    if is_existing:
+        text = old_text
+        if not FM.match(text):
+            text = new_note(x, files_prop) + "\n" + text
+        if x["due"]:
+            text = set_prop(text, "due", day(x["due"]))
+        if not old_props.get("files", "").strip() and files_prop:
+            text = set_prop(text, "files", files_prop)
+        if done(x) and old_props.get("status") not in ("done", "dropped"):
+            text = set_prop(text, "status", "done")
+        text = sync_auto_todo(text, x)
+        text = set_prop(set_prop(text, "moodle", x["cmid"]), "updated", date.today().isoformat())
+    else:
+        text = new_note(x, files_prop)
+
+    has_dl = dl_dir if (dl_dir and (saved or os.path.isdir(dl_dir) or (create_work_dir and not no_files))) else None
+    text = put_block(text, block_for(x, has_dl, saved, has_task_md=in_task_folder))
+
+    if is_existing and not task_changed and strip_volatile(old_text) == strip_volatile(text):
+        return "unchanged"
+
+    verb = "update" if is_existing else "new   "
+    print("%s %-5s %-10s %-10s %s%s" % (verb, x["subject"], day(x["due"]) or "-", x.get("state", "?"),
+                                        os.path.relpath(path, NOTES), how))
+    if not dry_run:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w", encoding="utf-8").write(text)
+    return "updated" if is_existing else "new"
+
+
+def parse_cmid(s):
+    m = re.search(r"id=(\d+)", s) or re.fullmatch(r"\s*(\d+)\s*", s)
+    if not m:
+        fail("give an assignment link (…/mod/assign/view.php?id=N) or its id: %r" % s)
+    return int(m.group(1))
+
+
+def cmd_add(a):
+    want_ids = [parse_cmid(s) for s in a.assignments]
+    by_id = {x["cmid"]: x for x in assignments(all_years=True, with_status=False)}
+    picked = []
+    for cid in want_ids:
+        x = by_id.get(cid)
+        if not x:
+            fail("assignment %d isn't in my courses (or Moodle hides it)" % cid)
+        if not x["subject"]:
+            fail("no subject for course %r; add it to %s" % (x["course"], SUBJECTS_FILE))
+        picked.append(x)
+
+    enrich_status(picked)
+    have = existing_notes()
+    claimed_notes = set(have.values())
+    claimed_dirs = set()
+    token = read_token()
+    counts = {"new": 0, "updated": 0, "unchanged": 0}
+    skipped_done = 0
+
+    for x in picked:
         path = have.get(x["cmid"])
         how = ""
         if not path:
-            path = match_by_name(x, set(have.values()))
-            how = " (linked by name: check it's the same assignment)" if path else ""
+            path = match_by_name(x, claimed_notes)
             if path:
+                how = " (linked by name: check it's the same assignment)"
                 have[x["cmid"]] = path
-        path = path or os.path.join(NOTES, x["subject"], name + ".md")
-        if os.path.exists(path):
-            text = open(path, encoding="utf-8").read()
-            if not FM.match(text):
-                text = new_note(x, files_dir) + "\n" + text
-            if x["due"]:
-                text = set_prop(text, "due", day(x["due"]))
-            if done(x) and props_of(text).get("status") not in ("done", "dropped"):
-                text = set_prop(text, "status", "done")
-            text = set_prop(set_prop(text, "moodle", x["cmid"]), "updated", date.today().isoformat())
-            updated += 1
-            verb = "update"
-        else:
-            text = new_note(x, files_dir)
-            made += 1
-            verb = "new   "
-        text = put_block(text, block_for(x, files_dir, saved))
-        print("%s %-5s %-10s %-10s %s%s" % (verb, x["subject"], day(x["due"]) or "-", x.get("state", "?"),
-                                          os.path.relpath(path, NOTES), how))
-        if not a.dry_run:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            open(path, "w", encoding="utf-8").write(text)
-    log("%d new, %d updated, %d skipped (no subject), %d without a due date left out (--undated)%s" % (
-        made, updated, skipped, undated, " — dry run, nothing written" if a.dry_run else ""))
+                claimed_notes.add(path)
+        if not path and done(x) and not a.force:
+            skipped_done += 1
+            log("skip (already finished/graded; pass --force to create anyway): %s" % x["name"])
+            continue
+        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token,
+                       create_work_dir=True, no_files=a.no_files, dry_run=a.dry_run, how=how)
+        counts[res] += 1
+
+    log("%d new, %d updated, %d unchanged%s%s" % (
+        counts["new"], counts["updated"], counts["unchanged"],
+        ", %d already done" % skipped_done if skipped_done else "",
+        " — dry run, nothing written" if a.dry_run else ""))
+
+
+def cmd_sync(a):
+    raw = assignments(with_status=False)
+    have = existing_notes()
+    claimed_notes = set(have.values())
+    matched = []
+    for x in raw:
+        if not x["subject"]:
+            continue
+        path = have.get(x["cmid"])
+        how = ""
+        if not path:
+            path = match_by_name(x, claimed_notes)
+            if path:
+                how = " (linked by name: check it's the same assignment)"
+                have[x["cmid"]] = path
+                claimed_notes.add(path)
+        if path and os.path.exists(path):
+            matched.append((x, path, how))
+
+    enrich_status([x for x, _, _ in matched])
+    token = read_token() if matched else ""
+    claimed_dirs = set()
+    counts = {"new": 0, "updated": 0, "unchanged": 0}
+
+    for x, path, how in matched:
+        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token,
+                       create_work_dir=False, no_files=a.no_files, dry_run=a.dry_run, how=how)
+        counts[res] += 1
+
+    log("%d updated, %d unchanged (tracked notes only; use `moodle add <id>` to create a new task folder)%s" % (
+        counts["updated"], counts["unchanged"], " — dry run, nothing written" if a.dry_run else ""))
 
 
 # ---- other commands -------------------------------------------------------------------------------------------
@@ -431,36 +1113,47 @@ def cmd_courses(a):
 
 
 def cmd_list(a):
-    items = assignments(a.all)
+    items = assignments(a.all, with_status=False)
     if not a.all:
-        items = [x for x in items if not done(x) and (not x["due"] or x["due"] > time.time() - 14 * 86400)]
+        items = [x for x in items if x["subject"] and not PLACEHOLDER.search(x["name"])
+                 and (not a.dated or x["due"])
+                 and (not x["due"] or x["due"] > time.time() - 30 * 86400)]
+    enrich_status(items)
+    if not a.all:
+        items = [x for x in items if not done(x)]
     if a.json:
         print(json.dumps(items, ensure_ascii=False, indent=1))
         return
     for x in items:
         late = x["due"] and x["due"] < time.time() and not done(x)
+        state = "no-upload" if x.get("state") == "none" else x.get("state", "?")
         print("%-17s %-5s %-10s %s%s  %s" % (when(x["due"])[4:] if x["due"] else "–", x["subject"] or "?",
-                                            x.get("state", "?"), "LATE " if late else "", x["name"][:60], x["url"]))
+                                             state, "LATE " if late else "", x["name"][:60], x["url"]))
 
 
 def cmd_show(a):
-    m = re.search(r"id=(\d+)", a.assignment) or re.fullmatch(r"\s*(\d+)\s*", a.assignment)
-    if not m:
-        fail("give an assignment link (…/mod/assign/view.php?id=N) or its id")
-    cmid = int(m.group(1))
-    x = next((x for x in assignments(all_years=True) if x["cmid"] == cmid), None)
+    cmid = parse_cmid(a.assignment)
+    x = next((x for x in assignments(all_years=True, with_status=False) if x["cmid"] == cmid), None)
     if not x:
         fail("assignment %d isn't in my courses (or Moodle hides it)" % cmid)
+    enrich_status([x])
+    if a.json:
+        print(json.dumps(x, ensure_ascii=False, indent=1))
+        return
+    state = "no online submission" if x.get("state") == "none" else x.get("state")
     print("%s: %s\n%s\nDue: %s%s\nSubmission: %s%s" % (
         x["subject"] or x["course"], x["name"], x["url"], when(x["due"]),
         " (cut-off %s)" % when(x["cutoff"]) if x["cutoff"] and x["cutoff"] != x["due"] else "",
-        x.get("state"), ", graded: %s" % x["grade"] if x.get("grade") else ""))
+        state, ", graded: %s" % x["grade"] if x.get("grade") else ""))
+    if x.get("feedback"):
+        print("Feedback: " + x["feedback"])
     if x["files"]:
-        print("Files: " + ", ".join(f["filename"] for f in x["files"]))
+        print("Files: " + ", ".join(os.path.basename(f["filename"]) for f in x["files"]))
     if x["intro"]:
         print("\n" + x["intro"])
-    if x.get("activity"):
-        print("\nInstructions:\n" + x["activity"])
+    act = extra_instructions(x)
+    if act:
+        print("\nInstructions:\n" + act)
 
 
 def main():
@@ -470,23 +1163,30 @@ def main():
     s = sub.add_parser("courses", help="enrolled courses and their subject")
     s.add_argument("--all", action="store_true", help="also past years")
     s.set_defaults(fn=cmd_courses)
-    s = sub.add_parser("list", help="open assignments (--all: everything)")
-    s.add_argument("--all", action="store_true")
+    s = sub.add_parser("list", help="open assignments, dated + undated (--all: everything)")
+    s.add_argument("--all", action="store_true", help="include finished, older and unmapped items")
+    s.add_argument("--dated", action="store_true", help="only assignments with a due date")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_list)
     s = sub.add_parser("show", help="one assignment in full")
     s.add_argument("assignment", help="link like …/mod/assign/view.php?id=25720, or the id")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_show)
-    s = sub.add_parser("sync", help="tracker notes + attachments for this year's assignments")
-    s.add_argument("--days", type=int, default=30, help="skip assignments due more than N days ago (default 30)")
-    s.add_argument("--all", action="store_true", help="also older ones")
-    s.add_argument("--undated", action="store_true", help="also assignments without a due date")
+    s = sub.add_parser("add", help="create folder (<Task Name>.md + TASK.md) + working folder for specific task(s)")
+    s.add_argument("assignments", nargs="+", help="assignment link(s) or id(s)")
+    s.add_argument("--no-files", action="store_true", help="don't create ~/Documents/Schule folder or download attachments")
+    s.add_argument("--force", action="store_true", help="create even if already finished/graded")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("sync", help="refresh existing tracker notes in ~/Notes/School/ (never bulk-creates folders)")
     s.add_argument("--no-files", action="store_true", help="don't download attachments")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(fn=cmd_sync)
     a = ap.parse_args()
     try:
         a.fn(a)
+    except MoodleError as e:
+        fail(str(e))
     except KeyboardInterrupt:
         sys.exit(130)
 
