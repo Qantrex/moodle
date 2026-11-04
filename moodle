@@ -105,8 +105,8 @@ SUBJECTS = {
 _token_cache = None
 UMASK = os.umask(0o022)
 os.umask(UMASK)
-TIMEOUT = 30                                                    # seconds per API call
-RETRY_DELAYS = (2, 5)                                           # waits before the 2nd and 3rd try
+TIMEOUT = float(os.environ.get("MOODLE_TIMEOUT") or 30)         # seconds per API call
+RETRY_DELAYS = tuple(float(x) for x in (os.environ.get("MOODLE_RETRY_DELAYS") or "2,5").split(",") if x.strip())
 RETRY_HTTP = {429, 500, 502, 503, 504}                          # worth another try; other HTTP errors aren't
 TOKEN_ERRORS = {"invalidtoken", "invalidtokenexpired"}
 EXIT_ERROR, EXIT_TOKEN, EXIT_NETWORK = 1, 2, 3
