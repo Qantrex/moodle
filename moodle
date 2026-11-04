@@ -24,6 +24,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -54,6 +55,9 @@ def load_config():
 CONFIG = load_config()
 NOTES = os.path.expanduser(os.environ.get("MOODLE_NOTES") or CONFIG.get("notes") or "~/.local/share/moodle/notes")
 FILES = os.path.expanduser(os.environ.get("MOODLE_FILES") or CONFIG.get("files") or "~/.local/share/moodle/files")
+STATE = os.path.expanduser(os.environ.get("MOODLE_STATE")
+                           or os.path.join(os.environ.get("XDG_STATE_HOME") or "~/.local/state", "moodle"))
+MAX_DOWNLOAD = int(float(os.environ.get("MOODLE_MAX_MB") or CONFIG.get("max_download_mb") or 100) * 2 ** 20)
 UA = "moodle-cli (personal, read-only)"
 
 
@@ -95,6 +99,8 @@ SUBJECTS = {
 }
 
 _token_cache = None
+UMASK = os.umask(0o022)
+os.umask(UMASK)
 TIMEOUT = 30                                                    # seconds per API call
 RETRY_DELAYS = (2, 5)                                           # waits before the 2nd and 3rd try
 RETRY_HTTP = {429, 500, 502, 503, 504}                          # worth another try; other HTTP errors aren't
@@ -248,23 +254,133 @@ def call(fn, token=None, **args):
     return out
 
 
-def download(url, dest, token, mtime=None):
+class DownloadError(Exception):
+    pass
+
+
+def download(url, dest, token, mtime=None, size=None):
+    """Fetch one attachment into dest (atomically). The token only ever goes to SITE, and no error names the URL."""
+    if not url.startswith(SITE + "/"):
+        raise DownloadError("not on %s, skipped (the token only goes to Moodle)" % SITE)
+    if size and int(size) > MAX_DOWNLOAD:
+        raise DownloadError("%.0f MB, over the %d MB limit (MOODLE_MAX_MB)" % (int(size) / 2 ** 20, MAX_DOWNLOAD >> 20))
+    url = urllib.parse.quote(url, safe=":/?&=%#+@,;~!$'()*[]")    # spaces etc. would make urllib raise with the URL
     sep = "&" if "?" in url else "?"
-    req = urllib.request.Request(url + sep + "token=" + token, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        body = r.read()
-    if body[:1] == b"{" and b'"errorcode"' in body[:200]:
-        raise OSError(json.loads(body).get("message", "download refused"))
+    req = urllib.request.Request(url + sep + urllib.parse.urlencode({"token": token}), headers={"User-Agent": UA})
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = dest + ".part"
-    with open(tmp, "wb") as f:
-        f.write(body)
-    os.replace(tmp, dest)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), prefix=".", suffix=".part")
+    try:
+        try:
+            with os.fdopen(fd, "wb") as f, urllib.request.urlopen(req, timeout=60) as r:
+                length = r.headers.get("Content-Length")
+                if length and length.isdigit() and int(length) > MAX_DOWNLOAD:
+                    raise DownloadError("over the %d MB limit (MOODLE_MAX_MB)" % (MAX_DOWNLOAD >> 20))
+                head, total = b"", 0
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD:
+                        raise DownloadError("over the %d MB limit (MOODLE_MAX_MB)" % (MAX_DOWNLOAD >> 20))
+                    if len(head) < 512:
+                        head += chunk[:512]
+                    f.write(chunk)
+        except urllib.error.HTTPError as e:
+            raise DownloadError("HTTP %d" % e.code) from None
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise DownloadError(redact("%s %s" % (type(e).__name__, getattr(e, "reason", e)))) from None
+        if head.lstrip()[:1] == b"{" and b'"errorcode"' in head and total < 1 << 16:
+            try:
+                with open(tmp, "rb") as f:
+                    err = json.load(f)
+            except ValueError:
+                err = None
+            if isinstance(err, dict) and err.get("errorcode"):
+                raise DownloadError(redact(err.get("error") or err.get("message") or err["errorcode"]))
+        os.chmod(tmp, 0o666 & ~UMASK)
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     if mtime:
         try:
-            os.utime(dest, (mtime, mtime))
+            os.utime(dest, (int(mtime), int(mtime)))
         except OSError:
             pass
+
+
+class Downloads:
+    """Remembers what was downloaded where (STATE/downloads.json), so a sync never overwrites a file you edited
+    and doesn't fetch an unchanged attachment again."""
+
+    def __init__(self):
+        self.path = os.path.join(STATE, "downloads.json")
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                self.seen = json.load(f)
+        except (OSError, ValueError):
+            self.seen = {}
+        self.dirty = False
+
+    @staticmethod
+    def remote(f):
+        return int(f.get("timemodified") or 0), int(f.get("filesize") if f.get("filesize") is not None else -1)
+
+    def plan(self, dest, f):
+        """'get' (missing or replaced in Moodle), 'skip' (up to date or your own edit, Moodle unchanged)
+        or 'beside' (Moodle has a new version but the local file was edited: keep it, save the new one next to it)."""
+        if not os.path.exists(dest):
+            return "get"
+        st = os.stat(dest)
+        tm, size = self.remote(f)
+        rec = self.seen.get(os.path.abspath(dest))
+        if rec:
+            untouched = rec["lsize"] == st.st_size and rec["lmtime"] == int(st.st_mtime)
+            same = (rec["tm"], rec["size"]) == (tm, size)
+            return "skip" if same else ("get" if untouched else "beside")
+        # No record (older versions, or a file that was already there). Older versions set mtime := timemodified.
+        ours = tm and abs(int(st.st_mtime) - tm) <= 1
+        if size < 0 or st.st_size == size:
+            self.remember(dest, f)
+            return "skip"
+        return "get" if ours else "beside"
+
+    def remember(self, dest, f):
+        st = os.stat(dest)
+        tm, size = self.remote(f)
+        self.seen[os.path.abspath(dest)] = {"tm": tm, "size": size, "lsize": st.st_size, "lmtime": int(st.st_mtime)}
+        self.dirty = True
+
+    def save(self):
+        if self.dirty:
+            write_atomic(self.path, json.dumps(self.seen, indent=0, sort_keys=True) + "\n")
+            self.dirty = False
+
+
+def beside_name(fname, f):
+    stem, ext = os.path.splitext(fname)
+    return "%s (Moodle %s)%s" % (stem, day(int(f.get("timemodified") or now_ts())), ext)
+
+
+def write_atomic(path, text):
+    """Write via a temp file + rename, so a crash or a syncing vault never sees a half-written file."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o666 & ~UMASK
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".", suffix=".moodle-tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 # ---- HTML -> Markdown -----------------------------------------------------------------------------------------
@@ -578,9 +694,12 @@ def merge_files(*lists):
         for f in lst or []:
             if not isinstance(f, dict) or not f.get("filename") or not f.get("fileurl"):
                 continue
-            key = (os.path.basename(f["filename"]), f["fileurl"])
-            if key not in seen:
-                seen.add(key)
+            name = os.path.basename(f["filename"])
+            keys = {(name, f["fileurl"])}
+            if f.get("filesize") is not None and f.get("timemodified"):
+                keys.add((name, f["filesize"], f["timemodified"]))     # same file listed under another URL
+            if not keys & seen:
+                seen |= keys
                 out.append(f)
     return out
 
@@ -722,13 +841,13 @@ TEMPLATE_TODO = re.compile(
 )
 
 
-def task_name(name):
+def task_name(name, fallback="Assignment"):
     """Exact task name, sanitizing only bytes forbidden by Linux paths or Obsidian LiveSync (\\/:*?\"<>|#)."""
     s = re.sub(r"[\x00-\x1f]+", "", name)
     s = re.sub(r"\s*:\s*", " - ", s).replace('"', "'").replace("/", "-")
     s = re.sub(r"[\\?<>|*#]+", "", s)
     s = re.sub(r"  +", " ", s).strip()
-    return s if s not in ("", ".", "..") else "Assignment"
+    return s if s not in ("", ".", "..") else fallback
 
 
 def kind_of(a):
@@ -979,22 +1098,23 @@ def new_note(a, files_dir):
     return "---\n%s\n---\n# %s\n\n> [!todo]\n%s\n" % (fm, heading_for(a), todo_for(a))
 
 
-def needs_download(dest, f):
-    if not os.path.exists(dest):
-        return True
-    if f.get("filesize") is not None:
-        try:
-            if os.path.getsize(dest) != int(f["filesize"]):
-                return True
-        except (OSError, ValueError):
-            pass
-    if f.get("timemodified"):
-        try:
-            if int(os.path.getmtime(dest)) < int(f["timemodified"]) - 1:
-                return True
-        except (OSError, ValueError):
-            pass
-    return False
+def is_git(d):
+    return bool(d) and os.path.exists(os.path.join(d, ".git"))
+
+
+def attachment_names(files):
+    """(local file name, file) pairs: names made safe like task names, and unique within the folder."""
+    used, out = set(), []
+    for f in files:
+        name = task_name(os.path.basename(f["filename"]), fallback="attachment")
+        stem, ext = os.path.splitext(name)
+        n = 2
+        while name.lower() in used:
+            name = "%s (%d)%s" % (stem, n, ext)
+            n += 1
+        used.add(name.lower())
+        out.append((name, f))
+    return out
 
 
 def pick_new_note_path(subject, name, cmid, claimed):
@@ -1017,18 +1137,18 @@ def resolve_files_dir(x, is_existing, old_props, claimed_dirs, create_work_dir=F
         exact = "%s (%d)" % (exact, x["cmid"])
     existing_files = old_props.get("files", "").strip() if is_existing else ""
     if existing_files:
-        in_schule = os.path.abspath(existing_files).startswith(os.path.abspath(FILES) + os.sep)
-        is_git = os.path.exists(os.path.join(existing_files, ".git"))
-        if in_schule and not is_git:
-            claimed_dirs.add(existing_files)
-            return existing_files, (existing_files if os.path.isdir(existing_files) or not already_finished else None)
-        if x["files"] and (os.path.isdir(exact) or not already_finished):
+        where = os.path.abspath(os.path.expanduser(existing_files))
+        in_files = where.startswith(os.path.abspath(FILES) + os.sep)
+        if in_files and not is_git(where):
+            claimed_dirs.add(where)
+            return existing_files, (where if os.path.isdir(where) or not already_finished else None)
+        if x["files"] and not is_git(exact) and (os.path.isdir(exact) or not already_finished):
             claimed_dirs.add(exact)
             return existing_files, exact
         return existing_files, None
     if os.path.isdir(exact) or ((x["files"] or create_work_dir) and not already_finished):
         claimed_dirs.add(exact)
-        return exact, exact
+        return exact, (None if is_git(exact) else exact)          # a repo cloned there is yours: no downloads
     return "", None
 
 
@@ -1050,7 +1170,8 @@ def sync_task_md(note_dir, x, dry_run):
     return True
 
 
-def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=False, no_files=False, dry_run=False, how=""):
+def sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads, create_work_dir=False, no_files=False,
+             dry_run=False, how=""):
     """Write or update one assignment's note, TASK.md and working/attachment folder. Returns 'new'|'updated'|'unchanged'."""
     is_existing = bool(path and os.path.exists(path))
     old_text = open(path, encoding="utf-8").read() if is_existing else ""
@@ -1070,17 +1191,23 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=
         os.makedirs(dl_dir, exist_ok=True)
 
     saved = []
-    for f in (x["files"] if dl_dir and not no_files else []):
-        fname = os.path.basename(f["filename"]).strip()
-        if not fname:
-            continue
+    for fname, f in attachment_names(x["files"] if dl_dir and not no_files else []):
         dest = os.path.join(dl_dir, fname)
-        if needs_download(dest, f) and not dry_run:
+        plan = downloads.plan(dest, f)
+        if plan == "beside":
+            fname = beside_name(fname, f)
+            dest = os.path.join(dl_dir, fname)
+            plan = downloads.plan(dest, f)
+            if plan == "get":
+                log("  %s was edited here and changed in Moodle: keeping yours, new one saved as %s" % (
+                    os.path.basename(dest), fname))
+        if plan == "get" and not dry_run:
             try:
-                download(f["fileurl"], dest, token, mtime=f.get("timemodified"))
-            except (OSError, urllib.error.URLError) as e:
+                download(f["fileurl"], dest, token, mtime=f.get("timemodified"), size=f.get("filesize"))
+            except DownloadError as e:
                 log("  can't download %s: %s" % (fname, e))
                 continue
+            downloads.remember(dest, f)
         saved.append(fname)
 
     task_changed = sync_task_md(note_dir, x, dry_run) if in_task_folder else False
@@ -1139,6 +1266,7 @@ def cmd_add(a):
     claimed_notes = set(have.values())
     claimed_dirs = set()
     token = read_token()
+    downloads = Downloads()
     counts = {"new": 0, "updated": 0, "unchanged": 0}
     skipped_done = 0
 
@@ -1155,9 +1283,11 @@ def cmd_add(a):
             skipped_done += 1
             log("skip (already finished/graded; pass --force to create anyway): %s" % x["name"])
             continue
-        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token,
+        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads,
                        create_work_dir=True, no_files=a.no_files, dry_run=a.dry_run, how=how)
         counts[res] += 1
+    if not a.dry_run:
+        downloads.save()
 
     log("%d new, %d updated, %d unchanged%s%s" % (
         counts["new"], counts["updated"], counts["unchanged"],
@@ -1186,13 +1316,16 @@ def cmd_sync(a):
 
     enrich_status([x for x, _, _ in matched])
     token = read_token() if matched else ""
+    downloads = Downloads()
     claimed_dirs = set()
     counts = {"new": 0, "updated": 0, "unchanged": 0}
 
     for x, path, how in matched:
-        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token,
+        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads,
                        create_work_dir=False, no_files=a.no_files, dry_run=a.dry_run, how=how)
         counts[res] += 1
+    if not a.dry_run:
+        downloads.save()
 
     log("%d updated, %d unchanged (tracked notes only; use `moodle add <id>` to create a new task folder)%s" % (
         counts["updated"], counts["unchanged"], " — dry run, nothing written" if a.dry_run else ""))
