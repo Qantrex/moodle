@@ -1317,7 +1317,9 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads, creat
 
 
 def parse_cmid(s):
-    m = re.search(r"id=(\d+)", s) or re.fullmatch(r"\s*(\d+)\s*", s)
+    if re.search(r"/(course|user|grade)/", s):
+        fail("that's not an assignment link (open the assignment and copy its link): %r" % s)
+    m = re.search(r"[?&](?:cm)?id=(\d+)", s) or re.fullmatch(r"\s*(\d+)\s*", s)
     if not m:
         fail("give an assignment link (…/mod/assign/view.php?id=N) or its id: %r" % s)
     return int(m.group(1))

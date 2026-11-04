@@ -192,3 +192,19 @@ class Token(MoodleCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Links(MoodleCase):
+    def test_parse_cmid(self):
+        p = self.m.parse_cmid
+        self.assertEqual(p("1001"), 1001)
+        self.assertEqual(p(" 1001\n"), 1001)
+        self.assertEqual(p("https://x.invalid/mod/assign/view.php?id=1001"), 1001)
+        self.assertEqual(p("https://x.invalid/mod/assign/view.php?userid=7&id=1001&action=grading"), 1001)
+        self.assertEqual(p("https://x.invalid/mod/assign/view.php?forceview=1&id=1001"), 1001)
+
+    def test_course_link_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.m.parse_cmid("https://x.invalid/course/view.php?id=11")
+        with self.assertRaises(SystemExit):
+            self.m.parse_cmid("no number here")
