@@ -363,6 +363,16 @@ def beside_name(fname, f):
     return "%s (Moodle %s)%s" % (stem, day(int(f.get("timemodified") or now_ts())), ext)
 
 
+def read_text(path):
+    """A note's text, or None (with a warning) if it isn't UTF-8: such a file is never rewritten."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        log("  skipping %s: not UTF-8" % path)
+        return None
+
+
 def write_atomic(path, text):
     """Write via a temp file + rename, so a crash or a syncing vault never sees a half-written file."""
     d = os.path.dirname(path) or "."
@@ -859,7 +869,7 @@ def yaml_val(v):
     if not s:
         return ""
     if (": " in s or " #" in s or s.endswith(":") or any(c in s for c in '"\\\n\r\t')
-            or s[0] in "[{*&!|>%@`?'\"-"):
+            or s[0] in "#[{*&!|>%@`?'\"-" or s != s.strip()):
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return s
 
@@ -921,7 +931,7 @@ def existing_notes():
         for f in fs:
             if f.endswith(".md"):
                 p = os.path.join(d, f)
-                cm = props_of(open(p, encoding="utf-8").read()).get("moodle", "")
+                cm = props_of(read_text(p) or "").get("moodle", "")
                 if cm.isdigit():
                     out[int(cm)] = p
     return out
@@ -975,7 +985,9 @@ def match_by_name(a, linked):
     c50 = {s.lower() for s in re.findall(r"classroom50\.org/[^\s)\"'>]+/assignments/([a-z0-9_-]+)", body, re.I)}
     best = None
     for p in candidate_tracker_notes(folder, linked):
-        text = open(p, encoding="utf-8").read()
+        text = read_text(p)
+        if text is None:
+            continue
         pr = props_of(text)
         if pr.get("moodle") or pr.get("type") not in ("assignment", "test"):
             continue
@@ -1156,8 +1168,8 @@ def sync_task_md(note_dir, x, dry_run):
     """Ensure TASK.md inside the vault's assignment folder holds the exact Moodle task description."""
     p = os.path.join(note_dir, "TASK.md")
     if os.path.exists(p):
-        old = open(p, encoding="utf-8").read()
-        if "<!-- moodle -->" not in old:
+        old = read_text(p)
+        if old is None or "<!-- moodle -->" not in old:
             return False
     else:
         old = None
@@ -1165,8 +1177,7 @@ def sync_task_md(note_dir, x, dry_run):
     if old == content:
         return False
     if not dry_run:
-        os.makedirs(note_dir, exist_ok=True)
-        open(p, "w", encoding="utf-8").write(content)
+        write_atomic(p, content)
     return True
 
 
@@ -1174,7 +1185,9 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads, creat
              dry_run=False, how=""):
     """Write or update one assignment's note, TASK.md and working/attachment folder. Returns 'new'|'updated'|'unchanged'."""
     is_existing = bool(path and os.path.exists(path))
-    old_text = open(path, encoding="utf-8").read() if is_existing else ""
+    old_text = read_text(path) if is_existing else ""
+    if old_text is None:
+        return "unchanged"
     old_props = props_of(old_text) if is_existing else {}
     if not path:
         path = pick_new_note_path(x["subject"], x["name"], x["cmid"], claimed_notes)
@@ -1237,8 +1250,7 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads, creat
     print("%s %-5s %-10s %-10s %s%s" % (verb, x["subject"], day(x["due"]) or "-", x.get("state", "?"),
                                         os.path.relpath(path, NOTES), how))
     if not dry_run:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "w", encoding="utf-8").write(text)
+        write_atomic(path, text)
     return "updated" if is_existing else "new"
 
 
