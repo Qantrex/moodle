@@ -100,6 +100,26 @@ def default_events(site=SITE):
     ]
 
 
+def grade(name, raw, shown, ts, cmid=None, module="assign", feedback="", rng="0,00–15,00", pct="-", itemtype="mod"):
+    return {"id": cmid or 0, "itemname": name, "itemtype": itemtype, "itemmodule": module if itemtype == "mod" else None,
+            "cmid": cmid, "graderaw": raw, "gradeformatted": shown, "rangeformatted": rng, "percentageformatted": pct,
+            "gradedategraded": ts, "gradedatesubmitted": ts and ts - DAY, "feedback": feedback, "feedbackformat": 1,
+            "gradeishidden": False}
+
+
+def default_grades():
+    return {
+        11: [
+            grade("Projekt Abgabe", 14.0, "14,00", NOW - 2 * DAY, cmid=1003, feedback="<p>Well done.</p><p>More tests.</p>",
+                  pct="93,33 %"),
+            grade("Test Kapitel 2", 9.0, "9,00", NOW - 40 * DAY, cmid=1000, module="quiz"),
+            grade("Aufgabe 1: REST API", None, "-", None, cmid=1001),
+            grade("Kurs gesamt", 23.0, "23,00", NOW, itemtype="course"),
+        ],
+        12: [grade("ER Modell", 5.0, "5,00 / 10,00", NOW - 1 * DAY, cmid=2000, rng="0–10")],
+    }
+
+
 class FakeMoodle:
     def __init__(self, site=SITE, token=TOKEN):
         self.site = site
@@ -107,7 +127,7 @@ class FakeMoodle:
         self.courses, self.assigns, self.status = assignment_data(site)
         self.files = {"55/mod_assign/introattachment/0/spec.pdf": PDF}
         self.events = default_events(site)
-        self.grade_items = {}
+        self.grade_items = default_grades()
         self.overview = []
         self.functions = None                    # site_info "functions": None = all known ones
         self.overrides = {}                      # fn -> answer (dict) or callable(params)

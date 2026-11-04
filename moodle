@@ -5,6 +5,7 @@
   moodle courses              enrolled courses and the subject each one maps to
   moodle list [--all]         open assignments (dated + undated): due date, subject, submission status
   moodle due [--days N]       what still needs doing, by deadline (--json: stable output for scripts and agents)
+  moodle grades [--days N]    recent grades and teacher feedback (--json)
   moodle show <link|id>       one assignment in full (description, attachments, submission, grade, feedback)
   moodle add <link|id> [...]  set up <notes>/<subject>/<Task Name>/ + <files>/<subject>/<Task Name>/
   moodle sync                 refresh existing tracker notes in <notes>/ (never bulk-creates folders)
@@ -1554,7 +1555,84 @@ def due_items(days=14, past=14, everything=False):
     return items
 
 
-SCHEMAS = {"due": DUE_SCHEMA}
+# ---- grades ---------------------------------------------------------------------------------------------------
+
+GRADES_SCHEMA = "moodle-grades/1"
+
+
+def is_graded(g):
+    return g.get("graderaw") is not None or (g.get("gradeformatted") or "-").strip() not in ("", "-")
+
+
+def grade_items(days=30, everything=False):
+    """Graded activities of the current courses, newest first. One call per course, a few in parallel."""
+    uid = site_info()["userid"]
+    cs = [c for c in courses() if everything or c["subject"]]
+
+    def one(c):
+        try:
+            r = call("gradereport_user_get_grade_items", courseid=c["id"], userid=uid)
+        except (TokenError, NetworkError):
+            raise
+        except MoodleError as e:
+            log("  note: no grades for %s (%s)" % (c.get("shortname"), e))
+            return []
+        return [(c, g) for ug in r.get("usergrades") or [] for g in ug.get("gradeitems") or []]
+
+    if not cs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(cs))) as ex:
+        pairs = [p for lst in ex.map(one, cs) for p in lst]
+    since = now_ts() - days * DAY
+    out = []
+    for c, g in pairs:
+        if g.get("itemtype") in ("course", "category") or not is_graded(g) or g.get("gradeishidden"):
+            continue
+        ts = int(g.get("gradedategraded") or g.get("gradedatesubmitted") or 0)
+        if not everything and ts < since:
+            continue
+        module, cmid = g.get("itemmodule") or None, g.get("cmid") or None
+        out.append({
+            "course": c.get("shortname") or c.get("fullname"),
+            "subject": c["subject"],
+            "name": plain(g.get("itemname")) or "?",
+            "module": module,
+            "cmid": cmid,
+            "grade": plain(g.get("gradeformatted")) or None,
+            "range": plain(g.get("rangeformatted")) or None,
+            "percentage": plain(g.get("percentageformatted")) or None,
+            "graded": iso(ts),
+            "graded_ts": ts,
+            "feedback": text_of(g.get("feedback")) if g.get("feedbackformat") in (1, None) else plain(g.get("feedback")),
+            "url": "%s/mod/%s/view.php?id=%d" % (SITE, module, cmid) if module and cmid else None,
+        })
+    out.sort(key=lambda x: (-x["graded_ts"], x["course"] or "", x["name"]))
+    return out
+
+
+def cmd_grades(a):
+    items = grade_items(a.days, a.all)
+    if a.json:
+        print(json.dumps({"schema": GRADES_SCHEMA, "site": SITE, "generated": iso(int(now_ts())),
+                          "timezone": str(TZ or "local"), "days": None if a.all else a.days, "items": items},
+                         ensure_ascii=False, indent=1))
+        return
+    if not items:
+        print("No new grades in the last %d days." % a.days if not a.all else "No grades yet.")
+        return
+    for x in items:
+        grade = x["grade"] or ""
+        if x["range"] and "/" not in grade:
+            grade += " / %s" % x["range"].split("–")[-1].split("-")[-1].strip()
+        if x["percentage"] and x["percentage"] != "-":
+            grade += " (%s)" % x["percentage"]
+        fb = (x["feedback"] or "").split("\n")[0]
+        print("%-6s %-5s %-40s %s%s" % (local(x["graded_ts"]).strftime("%d.%m.") if x["graded_ts"] else "",
+                                         x["subject"] or "?", x["name"][:40], grade,
+                                         "  " + (fb[:70] + "…" if len(fb) > 70 else fb) if fb else ""))
+
+
+SCHEMAS = {"due": DUE_SCHEMA, "grades": GRADES_SCHEMA}
 
 
 def cmd_due(a):
@@ -1594,6 +1672,11 @@ def main():
     s.add_argument("--all", action="store_true", help="include grade slots and admin pages")
     s.add_argument("--json", action="store_true", help="stable JSON (schema moodle-due/1)")
     s.set_defaults(fn=cmd_due)
+    s = sub.add_parser("grades", help="recent grades and feedback")
+    s.add_argument("--days", type=int, default=30, metavar="N", help="graded in the last N days (default 30)")
+    s.add_argument("--all", action="store_true", help="every grade of the current courses")
+    s.add_argument("--json", action="store_true", help="stable JSON (schema moodle-grades/1)")
+    s.set_defaults(fn=cmd_grades)
     s = sub.add_parser("show", help="one assignment in full")
     s.add_argument("assignment", help="link like …/mod/assign/view.php?id=25720, or the id")
     s.add_argument("--json", action="store_true")
