@@ -68,3 +68,29 @@ class FrontMatter(MoodleCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Names(MoodleCase):
+    def test_forbidden_characters(self):
+        n = self.m.task_name
+        self.assertEqual(n('Aufgabe 2: "Web" / API?'), "Aufgabe 2 - 'Web' - API")
+        self.assertEqual(n("C# <Basics> | 1*"), "C Basics 1")
+        self.assertEqual(n("tab\there\nnewline"), "tab here newline")
+
+    def test_hidden_and_trailing_dots(self):
+        self.assertEqual(self.m.task_name(".NET Projekt"), "NET Projekt")
+        self.assertEqual(self.m.task_name("Teil 1..."), "Teil 1")
+        self.assertEqual(self.m.task_name("..."), "Assignment")
+        self.assertEqual(self.m.task_name(".bashrc", fallback="attachment", keep_ext=True), "bashrc")
+
+    def test_long_names(self):
+        self.assertEqual(len(self.m.task_name("x" * 300)), self.m.MAX_NAME)
+        long_file = self.m.task_name("y" * 300 + ".pdf", keep_ext=True)
+        self.assertTrue(long_file.endswith("y.pdf") and len(long_file) == self.m.MAX_NAME, long_file)
+
+    def test_dot_name_is_found_again_by_sync(self):
+        self.fake.assigns[11][0]["name"] = ".NET: Intro"
+        self.run_cli("add", "1001")
+        self.assertTrue(os.path.exists(self.path("notes", "SEW", "NET - Intro", "NET - Intro.md")))
+        _, _, err = self.run_cli("sync")
+        self.assertIn("0 updated, 1 unchanged", err)

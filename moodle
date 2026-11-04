@@ -851,13 +851,22 @@ TEMPLATE_TODO = re.compile(
 )
 
 
-def task_name(name, fallback="Assignment"):
-    """Exact task name, sanitizing only bytes forbidden by Linux paths or Obsidian LiveSync (\\/:*?\"<>|#)."""
-    s = re.sub(r"[\x00-\x1f]+", "", name)
+MAX_NAME = 120                                                  # characters; file systems stop at 255 bytes
+
+
+def task_name(name, fallback="Assignment", keep_ext=False):
+    """Exact task name, sanitizing only what Linux paths or Obsidian LiveSync forbid (\\/:*?\"<>|#), plus what
+    breaks syncing: a leading dot (hidden: sync would never find the note again), trailing dots, overlong names."""
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", name)
     s = re.sub(r"\s*:\s*", " - ", s).replace('"', "'").replace("/", "-")
     s = re.sub(r"[\\?<>|*#]+", "", s)
-    s = re.sub(r"  +", " ", s).strip()
-    return s if s not in ("", ".", "..") else fallback
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > MAX_NAME:
+        stem, ext = os.path.splitext(s) if keep_ext else (s, "")
+        ext = ext if len(ext) <= 10 else ""
+        s = stem[:MAX_NAME - len(ext)].rstrip() + ext
+    s = s.lstrip(". ").rstrip(". ")
+    return s or fallback
 
 
 def kind_of(a):
@@ -1118,7 +1127,7 @@ def attachment_names(files):
     """(local file name, file) pairs: names made safe like task names, and unique within the folder."""
     used, out = set(), []
     for f in files:
-        name = task_name(os.path.basename(f["filename"]), fallback="attachment")
+        name = task_name(os.path.basename(f["filename"]), fallback="attachment", keep_ext=True)
         stem, ext = os.path.splitext(name)
         n = 2
         while name.lower() in used:
