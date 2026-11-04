@@ -80,13 +80,33 @@ def assignment_data(site=SITE):
     return courses, assigns, status
 
 
+def event(eid, cmid, name, ts, course, module="assign", action="Add submission", overdue=False, site=SITE):
+    return {"id": eid, "name": "%s is due" % name, "activityname": name, "modulename": module, "instance": cmid - 900,
+            "eventtype": "due", "timesort": ts, "overdue": overdue, "course": course,
+            "action": {"name": action, "url": "%s/mod/%s/view.php?id=%d&action=editsubmission" % (site, module, cmid),
+                       "actionable": True} if action else None,
+            "url": "%s/mod/%s/view.php?id=%d" % (site, module, cmid)}
+
+
+def default_events(site=SITE):
+    sew = {"id": 11, "shortname": "SEW 4XHIT 26/27", "fullname": "Softwareentwicklung 4XHIT 26/27"}
+    insy = {"id": 12, "shortname": "INSY4", "fullname": "Informationssysteme am Nachmittag"}
+    return [
+        event(1, 2001, "Datenbank Entwurf", 1793573940, insy, overdue=True, site=site),
+        event(2, 1004, "Test Kapitel 3", 1793835000, sew, module="quiz", action="Attempt quiz now", site=site),
+        event(3, 1001, "Aufgabe 1: REST API", 1794348000, sew, site=site),
+        event(4, 1002, "Note 1. Semester", 1794348000, sew, site=site),
+        event(5, 1005, "Reflexion &amp; Feedback", NOW + 30 * DAY, sew, action=None, site=site),
+    ]
+
+
 class FakeMoodle:
     def __init__(self, site=SITE, token=TOKEN):
         self.site = site
         self.token = token
         self.courses, self.assigns, self.status = assignment_data(site)
         self.files = {"55/mod_assign/introattachment/0/spec.pdf": PDF}
-        self.events = []
+        self.events = default_events(site)
         self.grade_items = {}
         self.overview = []
         self.functions = None                    # site_info "functions": None = all known ones

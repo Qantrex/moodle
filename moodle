@@ -4,6 +4,7 @@
   moodle token                one-time setup: get a personal token through TGM single sign-on (no password here)
   moodle courses              enrolled courses and the subject each one maps to
   moodle list [--all]         open assignments (dated + undated): due date, subject, submission status
+  moodle due [--days N]       what still needs doing, by deadline (--json: stable output for scripts and agents)
   moodle show <link|id>       one assignment in full (description, attachments, submission, grade, feedback)
   moodle add <link|id> [...]  set up <notes>/<subject>/<Task Name>/ + <files>/<subject>/<Task Name>/
   moodle sync                 refresh existing tracker notes in <notes>/ (never bulk-creates folders)
@@ -748,19 +749,29 @@ def site_info():
     return cached_call("core_webservice_get_site_info")
 
 
+_overrides = None
+
+
+def subject_overrides():
+    global _overrides
+    if _overrides is None:
+        _overrides = {}
+        try:
+            with open(SUBJECTS_FILE, encoding="utf-8") as f:
+                _overrides = json.load(f)
+            if not isinstance(_overrides, dict):
+                raise ValueError("not a {\"course\": \"SUBJECT\"} object")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log("moodle: ignoring %s: %s" % (SUBJECTS_FILE, e))
+            _overrides = {}
+    return _overrides
+
+
 def courses(all_years=False):
     cs = cached_call("core_enrol_get_users_courses", userid=site_info()["userid"])
-    overrides = {}
-    try:
-        with open(SUBJECTS_FILE, encoding="utf-8") as f:
-            overrides = json.load(f)
-        if not isinstance(overrides, dict):
-            raise ValueError("not a {\"course\": \"SUBJECT\"} object")
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError) as e:
-        log("moodle: ignoring %s: %s" % (SUBJECTS_FILE, e))
-        overrides = {}
+    overrides = subject_overrides()
     out = []
     for c in cs:
         if not all_years and not current(c):
@@ -1481,6 +1492,90 @@ def cmd_show(a):
         print("\nInstructions:\n" + act)
 
 
+# ---- due: the timeline, for people and scripts -----------------------------------------------------------------
+
+DUE_SCHEMA = "moodle-due/1"
+DAY = 86400
+EVENTS_PAGE = 50                                                # Moodle's maximum per call
+
+
+def iso(ts):
+    return local(ts).isoformat(timespec="seconds") if ts else None
+
+
+def plain(s):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", str(s or ""))).replace("\xa0", " ")).strip()
+
+
+def action_events(frm, to):
+    """Everything with a deadline that still needs doing (the Moodle app's timeline), all pages of it."""
+    out, after = [], 0
+    for _ in range(40):
+        args = dict(timesortfrom=frm, timesortto=to, limitnum=EVENTS_PAGE)
+        if after:
+            args["aftereventid"] = after
+        page = (call("core_calendar_get_action_events_by_timesort", **args) or {}).get("events") or []
+        out += page
+        if len(page) < EVENTS_PAGE:
+            break
+        after = page[-1]["id"]
+    return out
+
+
+def due_items(days=14, past=14, everything=False):
+    n = int(now_ts())
+    items, seen = [], set()
+    for e in action_events(n - past * DAY, n + days * DAY):
+        if e.get("id") in seen:
+            continue
+        seen.add(e.get("id"))
+        c = e.get("course") or {}
+        name = plain(e.get("activityname") or e.get("name"))
+        if not everything and PLACEHOLDER.search(name):
+            continue
+        ts = int(e.get("timesort") or 0)
+        act = e.get("action") or {}
+        url = e.get("url") or ""
+        cm = re.search(r"[?&]id=(\d+)", url)
+        items.append({
+            "id": e.get("id"),
+            "cmid": int(cm.group(1)) if cm else None,
+            "module": e.get("modulename") or None,
+            "course": plain(c.get("shortname") or c.get("fullname")),
+            "subject": subject_of(c, subject_overrides()) if c else None,
+            "name": name,
+            "due": iso(ts),
+            "due_ts": ts,
+            "overdue": bool(e.get("overdue")) or ts < n,
+            "action": plain(act.get("name")) or None,
+            "url": browser_url(url) or None,
+        })
+    items.sort(key=lambda x: (x["due_ts"], x["course"], x["name"]))
+    return items
+
+
+SCHEMAS = {"due": DUE_SCHEMA}
+
+
+def cmd_due(a):
+    n = int(now_ts())
+    items = due_items(a.days, a.past, a.all)
+    if a.json:
+        print(json.dumps({
+            "schema": DUE_SCHEMA, "site": SITE, "generated": iso(n), "timezone": str(TZ or "local"),
+            "from": iso(n - a.past * DAY), "to": iso(n + a.days * DAY), "items": items,
+        }, ensure_ascii=False, indent=1))
+        return
+    late = sum(x["overdue"] for x in items)
+    if not items:
+        print("Nothing due in the next %d days." % a.days)
+        return
+    print("%d due in the next %d days%s:" % (len(items) - late, a.days, ", %d overdue" % late if late else ""))
+    for x in items:
+        print("%-8s %s  %-5s %s%s" % ("OVERDUE" if x["overdue"] else "", local(x["due_ts"]).strftime("%a %d.%m. %H:%M"),
+                                     x["subject"] or "?", x["name"], "  (%s)" % x["action"] if x["action"] else ""))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="moodle", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1493,6 +1588,12 @@ def main():
     s.add_argument("--dated", action="store_true", help="only assignments with a due date")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("due", help="what still needs doing, by deadline (the app's timeline); --json for scripts")
+    s.add_argument("--days", type=int, default=14, metavar="N", help="days ahead (default 14)")
+    s.add_argument("--past", type=int, default=14, metavar="N", help="overdue items from the last N days (default 14)")
+    s.add_argument("--all", action="store_true", help="include grade slots and admin pages")
+    s.add_argument("--json", action="store_true", help="stable JSON (schema moodle-due/1)")
+    s.set_defaults(fn=cmd_due)
     s = sub.add_parser("show", help="one assignment in full")
     s.add_argument("assignment", help="link like …/mod/assign/view.php?id=25720, or the id")
     s.add_argument("--json", action="store_true")
@@ -1511,6 +1612,9 @@ def main():
     try:
         a.fn(a)
     except MoodleError as e:
+        if getattr(a, "json", False):                           # scripts get the error as JSON on stdout too
+            err = {"error": {"code": e.code, "message": str(e)}}
+            print(json.dumps(dict({"schema": SCHEMAS[a.cmd]} if a.cmd in SCHEMAS else {}, **err), ensure_ascii=False))
         fail(str(e), e.exit_code)
     except KeyboardInterrupt:
         sys.exit(130)
