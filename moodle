@@ -409,6 +409,8 @@ HTML_TAGS = {
 def browser_url(u):
     """Turn token-gated /webservice/pluginfile.php links into regular SSO /pluginfile.php links."""
     u = (u or "").strip()
+    u = re.sub(r"([?&])(?:ws)?token=[^&#]*(&|(?=#)|$)", lambda m: m.group(1) if m.group(2) else "", u)
+    u = re.sub(r"[?&](?=#|$)", "", u)                            # never copy a token into a note
     return u.replace(SITE + "/webservice/pluginfile.php/", SITE + "/pluginfile.php/")
 
 
@@ -419,12 +421,13 @@ class _MDParser(html.parser.HTMLParser):
         self.skip = 0
         self.pre = 0
         self.code = 0
-        self.lists = []          # [["ul", 0], ["ol", 2], ...]
+        self.lists = []          # [["ul", items so far, inside an <li>], ["ol", 2, True], ...]
         self.in_li = 0
         self.li_has_text = False
         self.links = []          # [(href, start_idx)]
         self.marks = []          # [(marker, start_idx, active)]
         self.table = None        # rows: [[cell_str, ...], ...]
+        self.tables = 0          # nesting depth: inner tables are flattened into the outer cell
         self.cell = None         # list of chunks when inside td/th
 
     def _buf(self):
@@ -531,13 +534,16 @@ class _MDParser(html.parser.HTMLParser):
                 self._open_mark("`")
         elif t in ("ul", "ol"):
             self._nl(1 if self.lists else 2)
-            self.lists.append([t, 0])
+            self.lists.append([t, 0, False])
         elif t == "li":
             self._nl(1)
             if not self.lists:
-                self.lists.append(["ul", 0])
+                self.lists.append(["ul", 0, False])
+            if self.lists[-1][2]:                               # <li> without </li> before the next one
+                self.in_li = max(0, self.in_li - 1)
             self.lists[-1][1] += 1
-            kind, num = self.lists[-1]
+            self.lists[-1][2] = True
+            kind, num, _ = self.lists[-1]
             indent = "  " * (len(self.lists) - 1)
             self._emit("%s%s" % (indent, ("%d. " % num) if kind == "ol" else "- "))
             self.in_li += 1
@@ -547,17 +553,31 @@ class _MDParser(html.parser.HTMLParser):
         elif t == "img":
             src = browser_url(at.get("src"))
             alt = (at.get("alt") or "").strip()
-            if src:
+            if src.startswith("data:"):                         # a pasted screenshot: megabytes of base64
+                self._emit("*(image%s)*" % (": " + alt if alt else ""))
+            elif src:
                 self._emit("![%s](%s)" % (alt, src))
         elif t == "table":
-            if self.table is None:
+            self.tables += 1
+            if self.tables == 1:
+                self._end_cell()
                 self._nl(2)
                 self.table = []
+            else:
+                self._emit(" ")
         elif t == "tr":
-            if self.table is not None:
+            if self.tables > 1:
+                self._emit(" ")
+            elif self.table is not None:
+                self._end_cell()
                 self.table.append([])
         elif t in ("td", "th"):
-            if self.table is not None and self.table:
+            if self.tables > 1:
+                self._emit(" ")
+            elif self.table is not None:
+                self._end_cell()                                # </td> is optional in HTML
+                if not self.table:
+                    self.table.append([])
                 self.cell = []
 
     def handle_endtag(self, tag):
@@ -593,10 +613,14 @@ class _MDParser(html.parser.HTMLParser):
                 self._close_mark("`")
         elif t in ("ul", "ol"):
             if self.lists:
+                if self.lists[-1][2]:
+                    self.in_li = max(0, self.in_li - 1)
                 self.lists.pop()
             self._nl(1 if self.lists else 2)
         elif t == "li":
-            self.in_li = max(0, self.in_li - 1)
+            if self.lists and self.lists[-1][2]:
+                self.lists[-1][2] = False
+                self.in_li = max(0, self.in_li - 1)
             self._nl(1)
         elif t == "a":
             if self.links:
@@ -611,12 +635,12 @@ class _MDParser(html.parser.HTMLParser):
                 else:
                     b.append("[%s](%s)" % (label, href))
         elif t in ("td", "th"):
-            if self.cell is not None and self.table:
-                txt = re.sub(r"\s+", " ", "".join(self.cell)).strip().replace("|", r"\|")
-                self.table[-1].append(txt)
-                self.cell = None
+            if self.tables == 1:
+                self._end_cell()
         elif t == "table":
-            if self.table is not None:
+            self.tables = max(0, self.tables - 1)
+            if self.tables == 0 and self.table is not None:
+                self._end_cell()
                 rows = [r for r in self.table if any(r)]
                 self.table = None
                 if rows:
@@ -625,6 +649,18 @@ class _MDParser(html.parser.HTMLParser):
                     lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * cols]
                     lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
                     self._emit("\n".join(lines) + "\n\n")
+
+    def _end_cell(self):
+        if self.cell is not None and self.table:
+            txt = re.sub(r"\s+", " ", "".join(self.cell)).strip().replace("|", r"\|")
+            self.table[-1].append(txt)
+        self.cell = None
+
+    def close(self):
+        super().close()
+        if self.table is not None:                              # unclosed table at the end: keep its text
+            self.tables = 1
+            self.handle_endtag("table")
 
     def handle_data(self, data):
         if self.skip or not data:
