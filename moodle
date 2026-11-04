@@ -6,6 +6,7 @@
   moodle list [--all]         open assignments (dated + undated): due date, subject, submission status
   moodle due [--days N]       what still needs doing, by deadline (--json: stable output for scripts and agents)
   moodle grades [--days N]    recent grades and teacher feedback (--json)
+  moodle doctor               check config, token and site without showing the token
   moodle show <link|id>       one assignment in full (description, attachments, submission, grade, feedback)
   moodle add <link|id> [...]  set up <notes>/<subject>/<Task Name>/ + <files>/<subject>/<Task Name>/
   moodle sync                 refresh existing tracker notes in <notes>/ (never bulk-creates folders)
@@ -1635,6 +1636,81 @@ def cmd_grades(a):
 SCHEMAS = {"due": DUE_SCHEMA, "grades": GRADES_SCHEMA}
 
 
+# ---- doctor ---------------------------------------------------------------------------------------------------
+
+CONFIG_KEYS = {"notes", "files", "timezone", "max_download_mb"}
+NEEDED = {                                                      # web-service function -> what needs it
+    "core_enrol_get_users_courses": "everything", "mod_assign_get_assignments": "list/show/add/sync",
+    "mod_assign_get_submission_status": "submission status", "core_calendar_get_action_events_by_timesort": "due",
+    "gradereport_user_get_grade_items": "grades",
+}
+
+
+def token_source():
+    """(where the token comes from, problem or None). Never reads it out."""
+    if os.environ.get("MOODLE_TOKEN", "").strip():
+        return "MOODLE_TOKEN", None
+    if os.environ.get("MOODLE_TOKEN_CMD"):
+        return "MOODLE_TOKEN_CMD", None
+    try:
+        st = os.stat(TOKEN_FILE)
+    except OSError:
+        return TOKEN_FILE, "missing: run `moodle token`"
+    if st.st_mode & 0o077:
+        return TOKEN_FILE, "readable by others: chmod 600 %s" % TOKEN_FILE
+    return TOKEN_FILE, None
+
+
+def cmd_doctor(a):
+    """Check config, token and site without printing the token. Exit 1 if anything FAILs."""
+    bad = []
+
+    def say(level, msg):
+        print("%-4s %s" % (level, redact(msg)))
+        if level == "FAIL":
+            bad.append(msg)
+
+    say("ok" if sys.version_info >= (3, 11) else "FAIL", "Python %d.%d" % sys.version_info[:2])
+    cfg = os.path.join(CONF, "config.toml")
+    if os.path.exists(cfg):
+        unknown = sorted(set(CONFIG) - CONFIG_KEYS)
+        say("warn" if unknown else "ok", "config %s%s" % (cfg, " (unknown keys: %s)" % ", ".join(unknown) if unknown else ""))
+    else:
+        say("warn", "no %s: notes and files go to the defaults" % cfg)
+    for label, d in (("notes", NOTES), ("files", FILES)):
+        say("ok" if os.path.isdir(d) else "warn", "%s folder %s%s" % (label, d, "" if os.path.isdir(d) else " (missing)"))
+    say("ok" if TZ else "warn", "time zone %s" % (TZ or "of this machine"))
+    where, problem = token_source()
+    say("FAIL" if problem and "missing" in problem else ("warn" if problem else "ok"),
+        "token from %s%s" % (where, ": " + problem if problem else ""))
+    if problem and "missing" in problem:
+        sys.exit(EXIT_TOKEN)
+    try:
+        tok = read_token()
+        if not re.fullmatch(r"[0-9a-f]{32}", tok):
+            say("warn", "the token doesn't look like Moodle's usual 32 hex characters")
+        info = site_info()
+    except MoodleError as e:
+        say("FAIL", "%s: %s" % (SITE, e))
+        sys.exit(e.exit_code)
+    say("ok", "%s: %s, Moodle %s, logged in as %s" % (SITE, info.get("sitename"), (info.get("release") or "?").split(" ")[0],
+                                                     info.get("username")))
+    have = {f.get("name") for f in info.get("functions") or []}
+    for fn, use in NEEDED.items():
+        if have and fn not in have:
+            say("warn", "the site doesn't offer %s (needed for %s)" % (fn, use))
+    try:
+        cs = courses()
+    except MoodleError as e:
+        say("FAIL", "courses: %s" % e)
+        sys.exit(e.exit_code)
+    unmapped = [c.get("shortname") or c.get("fullname") for c in cs if not c["subject"]]
+    say("warn" if unmapped else "ok", "%d current courses%s" % (
+        len(cs), "; no subject for: %s (add to %s)" % (", ".join(unmapped), SUBJECTS_FILE) if unmapped else ""))
+    if bad:
+        sys.exit(EXIT_ERROR)
+
+
 def cmd_due(a):
     n = int(now_ts())
     items = due_items(a.days, a.past, a.all)
@@ -1677,6 +1753,7 @@ def main():
     s.add_argument("--all", action="store_true", help="every grade of the current courses")
     s.add_argument("--json", action="store_true", help="stable JSON (schema moodle-grades/1)")
     s.set_defaults(fn=cmd_grades)
+    sub.add_parser("doctor", help="check config, token and site (never prints the token)").set_defaults(fn=cmd_doctor)
     s = sub.add_parser("show", help="one assignment in full")
     s.add_argument("assignment", help="link like …/mod/assign/view.php?id=25720, or the id")
     s.add_argument("--json", action="store_true")
