@@ -1604,7 +1604,7 @@ def grade_items(days=30, everything=False):
             "percentage": plain(g.get("percentageformatted")) or None,
             "graded": iso(ts),
             "graded_ts": ts,
-            "feedback": text_of(g.get("feedback")) if g.get("feedbackformat") in (1, None) else plain(g.get("feedback")),
+            "feedback": text_of(g.get("feedback")) if g.get("feedbackformat") in (0, 1, None) else plain(g.get("feedback")),
             "url": "%s/mod/%s/view.php?id=%d" % (SITE, module, cmid) if module and cmid else None,
         })
     out.sort(key=lambda x: (-x["graded_ts"], x["course"] or "", x["name"]))

@@ -53,6 +53,11 @@ class Grades(MoodleCase):
         self.assertIn("no grades for INSY4", err)
         self.assertIn("Projekt Abgabe", out)
 
+    def test_moodle_format_feedback_is_html_too(self):
+        self.fake.grade_items[11][0]["feedbackformat"] = 0
+        _, out, _ = self.run_cli("grades", "--json")
+        self.assertEqual(json.loads(out)["items"][1]["feedback"], "Well done.\n\nMore tests.")
+
     def test_nothing_new(self):
         self.fake.grade_items = {}
         _, out, _ = self.run_cli("grades")
