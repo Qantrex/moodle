@@ -29,7 +29,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SITE = os.environ.get("MOODLE_URL", "https://elearning.tgm.ac.at").rstrip("/")
 CONF = os.path.expanduser(os.environ.get("MOODLE_CONFIG", "~/.config/moodle"))
@@ -53,6 +54,35 @@ CONFIG = load_config()
 NOTES = os.path.expanduser(os.environ.get("MOODLE_NOTES") or CONFIG.get("notes") or "~/.local/share/moodle/notes")
 FILES = os.path.expanduser(os.environ.get("MOODLE_FILES") or CONFIG.get("files") or "~/.local/share/moodle/files")
 UA = "moodle-cli (personal, read-only)"
+
+
+def load_tz():
+    """Due dates are shown in the school's time zone, not the machine's (a server or CI may run in UTC)."""
+    name = os.environ.get("MOODLE_TZ") or CONFIG.get("timezone") or "Europe/Vienna"
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        print("moodle: unknown time zone %r, using the machine's" % name, file=sys.stderr)
+        return None
+
+
+TZ = load_tz()
+
+
+def now_ts():
+    """The current time; MOODLE_NOW (ISO 8601) pins it for tests."""
+    pinned = os.environ.get("MOODLE_NOW")
+    if pinned:
+        return datetime.fromisoformat(pinned).timestamp()
+    return time.time()
+
+
+def local(ts):
+    return datetime.fromtimestamp(ts, TZ)
+
+
+def today():
+    return local(now_ts()).date()
 
 # subject code -> words that identify its courses (code itself always counts)
 SUBJECTS = {
@@ -471,14 +501,14 @@ def school_year(course):
     m = re.search(r"\b(\d{2})\s*/\s*(\d{2})\b", course.get("fullname", "") + " " + course.get("shortname", ""))
     if m:
         return "20%s-%s" % (m.group(1), m.group(2))
-    t = datetime.fromtimestamp(course["startdate"]) if course.get("startdate") else datetime.now()
+    t = local(course["startdate"] if course.get("startdate") else now_ts())
     y = t.year if t.month >= 7 else t.year - 1                # courses set up in July/August belong to the new year
     return "%d-%02d" % (y, (y + 1) % 100)
 
 
 def current(course):
     end = course.get("enddate") or 0
-    return not end or end > time.time() - 30 * 86400            # running, or ended less than a month ago
+    return not end or end > now_ts() - 30 * 86400            # running, or ended less than a month ago
 
 
 def courses(all_years=False):
@@ -600,11 +630,11 @@ def assignments(all_years=False, with_status=True):
 
 
 def day(ts):
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
+    return local(ts).strftime("%Y-%m-%d") if ts else ""
 
 
 def when(ts):
-    return datetime.fromtimestamp(ts).strftime("%a %d.%m.%Y %H:%M") if ts else "no due date"
+    return local(ts).strftime("%a %d.%m.%Y %H:%M") if ts else "no due date"
 
 
 FAIL_GRADE = re.compile(
@@ -819,7 +849,7 @@ def task_md_for(a):
              "- **Due:** %s" % when(a["due"])]
     if a["cutoff"] and a["cutoff"] != a["due"]:
         lines.append("- **Last chance (cut-off):** %s" % when(a["cutoff"]))
-    if a["opens"] and a["opens"] > time.time():
+    if a["opens"] and a["opens"] > now_ts():
         lines.append("- **Opens:** %s" % when(a["opens"]))
     if a["intro"]:
         lines += ["", "## Task", "", a["intro"]]
@@ -833,11 +863,11 @@ def task_md_for(a):
 
 def block_for(a, dl_dir, saved, has_task_md=False):
     lines = ["## Moodle", "",
-             "*synced %s by `moodle sync`; edit outside this block*" % datetime.now().strftime("%Y-%m-%d %H:%M"), "",
+             "*synced %s by `moodle sync`; edit outside this block*" % local(now_ts()).strftime("%Y-%m-%d %H:%M"), "",
              "- **Link:** %s" % a["url"], "- **Course:** %s" % a["course"], "- **Due:** %s" % when(a["due"])]
     if a["cutoff"] and a["cutoff"] != a["due"]:
         lines.append("- **Last chance (cut-off):** %s" % when(a["cutoff"]))
-    if a["opens"] and a["opens"] > time.time():
+    if a["opens"] and a["opens"] > now_ts():
         lines.append("- **Opens:** %s" % when(a["opens"]))
     sub_label = "no online submission" if a.get("state") == "none" else a.get("state", "?")
     lines.append("- **Submission:** %s%s" % (sub_label, ", graded: %s" % a["grade"] if a.get("grade") else ""))
@@ -898,7 +928,7 @@ def new_note(a, files_dir):
         yaml_line("due", day(a["due"])),
         yaml_line("files", files_dir),
         yaml_line("moodle", a["cmid"]),
-        yaml_line("updated", date.today().isoformat()),
+        yaml_line("updated", today().isoformat()),
     ])
     return "---\n%s\n---\n# %s\n\n> [!todo]\n%s\n" % (fm, heading_for(a), todo_for(a))
 
@@ -1020,7 +1050,7 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=
         if done(x) and old_props.get("status") not in ("done", "dropped"):
             text = set_prop(text, "status", "done")
         text = sync_auto_todo(text, x)
-        text = set_prop(set_prop(text, "moodle", x["cmid"]), "updated", date.today().isoformat())
+        text = set_prop(set_prop(text, "moodle", x["cmid"]), "updated", today().isoformat())
     else:
         text = new_note(x, files_prop)
 
@@ -1134,7 +1164,7 @@ def cmd_list(a):
     if not a.all:
         items = [x for x in items if x["subject"] and not PLACEHOLDER.search(x["name"])
                  and (not a.dated or x["due"])
-                 and (not x["due"] or x["due"] > time.time() - 30 * 86400)]
+                 and (not x["due"] or x["due"] > now_ts() - 30 * 86400)]
     enrich_status(items)
     if not a.all:
         items = [x for x in items if not done(x)]
@@ -1142,7 +1172,7 @@ def cmd_list(a):
         print(json.dumps(items, ensure_ascii=False, indent=1))
         return
     for x in items:
-        late = x["due"] and x["due"] < time.time() and not done(x)
+        late = x["due"] and x["due"] < now_ts() and not done(x)
         state = "no-upload" if x.get("state") == "none" else x.get("state", "?")
         print("%-17s %-5s %-10s %s%s  %s" % (when(x["due"])[4:] if x["due"] else "–", x["subject"] or "?",
                                              state, "LATE " if late else "", x["name"][:60], x["url"]))
