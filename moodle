@@ -693,20 +693,30 @@ def text_of(htm):
 # ---- data -----------------------------------------------------------------------------------------------------
 
 def subject_of(course, overrides):
-    for key in (course.get("shortname", ""), course.get("fullname", "")):
+    """Subject code of a course: an override, else the code in the short name, else the subject's name,
+    else an upper-case code in the full name. Plain words like "am" or "E-Learning" don't count as AM or E."""
+    short, full = course.get("shortname") or "", course.get("fullname") or ""
+    lower = {k.lower(): v for k, v in overrides.items()}
+    for key in (short, full):
         if key in overrides:
-            return overrides[key]
-    text = ("%s %s" % (course.get("shortname", ""), course.get("fullname", ""))).lower()
-    for code, words in SUBJECTS.items():
-        if re.search(r"(?<![a-z])%s(?![a-z])" % code.lower(), text) or any(re.search(w, text) for w in words):
-            return code
-    return None
+            return overrides[key] or None                       # "": ignore this course
+        if key.lower() in lower:
+            return lower[key.lower()] or None
+
+    def code_in(text, flags=0):
+        return next((c for c in SUBJECTS
+                     if re.search(r"(?<![A-Za-zÄÖÜäöü])%s(?![A-Za-zÄÖÜäöü]|-[A-Za-z])" % c, text, flags)), None)
+
+    text = ("%s %s" % (short, full)).lower()
+    return (code_in(short, re.I)
+            or next((c for c, ws in SUBJECTS.items() if any(re.search(w, text) for w in ws)), None)
+            or code_in(full))
 
 
 def school_year(course):
-    m = re.search(r"\b(\d{2})\s*/\s*(\d{2})\b", course.get("fullname", "") + " " + course.get("shortname", ""))
-    if m:
-        return "20%s-%s" % (m.group(1), m.group(2))
+    for m in re.finditer(r"\b(\d{2})\s*/\s*(\d{2})\b", course.get("fullname", "") + " " + course.get("shortname", "")):
+        if int(m.group(2)) == (int(m.group(1)) + 1) % 100:     # 26/27, not a date like 10/12
+            return "20%s-%s" % (m.group(1), m.group(2))
     t = local(course["startdate"] if course.get("startdate") else now_ts())
     y = t.year if t.month >= 7 else t.year - 1                # courses set up in July/August belong to the new year
     return "%d-%02d" % (y, (y + 1) % 100)
@@ -720,9 +730,16 @@ def current(course):
 def courses(all_years=False):
     me = call("core_webservice_get_site_info")
     cs = call("core_enrol_get_users_courses", userid=me["userid"])
+    overrides = {}
     try:
-        overrides = json.load(open(SUBJECTS_FILE))
-    except (OSError, ValueError):
+        with open(SUBJECTS_FILE, encoding="utf-8") as f:
+            overrides = json.load(f)
+        if not isinstance(overrides, dict):
+            raise ValueError("not a {\"course\": \"SUBJECT\"} object")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        log("moodle: ignoring %s: %s" % (SUBJECTS_FILE, e))
         overrides = {}
     out = []
     for c in cs:
@@ -1357,6 +1374,9 @@ def cmd_sync(a):
     have = existing_notes()
     claimed_notes = set(have.values())
     matched = []
+    unmapped = sorted({x["course"] for x in raw if not x["subject"]})
+    if unmapped:
+        log("no subject for %s (add to %s to sync them)" % (", ".join(unmapped), SUBJECTS_FILE))
     for x in raw:
         if not x["subject"]:
             continue
