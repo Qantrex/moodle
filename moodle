@@ -17,6 +17,7 @@ import getpass
 import hashlib
 import html
 import html.parser
+import http.client
 import json
 import os
 import re
@@ -94,18 +95,45 @@ SUBJECTS = {
 }
 
 _token_cache = None
+TIMEOUT = 30                                                    # seconds per API call
+RETRY_DELAYS = (2, 5)                                           # waits before the 2nd and 3rd try
+RETRY_HTTP = {429, 500, 502, 503, 504}                          # worth another try; other HTTP errors aren't
+TOKEN_ERRORS = {"invalidtoken", "invalidtokenexpired"}
+EXIT_ERROR, EXIT_TOKEN, EXIT_NETWORK = 1, 2, 3
 
 
 class MoodleError(Exception):
-    pass
+    """Moodle answered with an error. code is Moodle's errorcode (or ours: network, token, …)."""
+    exit_code = EXIT_ERROR
+
+    def __init__(self, msg, code="error"):
+        super().__init__(msg)
+        self.code = code
+
+
+class TokenError(MoodleError):
+    exit_code = EXIT_TOKEN
+
+
+class NetworkError(MoodleError):
+    exit_code = EXIT_NETWORK
+
+
+def redact(s):
+    """Never let the token reach the terminal, a log or a note, even inside an error message."""
+    s = str(s)
+    if _token_cache and len(_token_cache) >= 8:
+        s = s.replace(_token_cache, "***")
+    return re.sub(r"((?:ws)?token=)[A-Za-z0-9+/=_%-]{8,}", r"\1***", s)
 
 
 def log(*a):
-    print(*a, file=sys.stderr)
+    print(*(redact(x) for x in a), file=sys.stderr)
 
 
-def fail(msg):
-    sys.exit("moodle: " + msg)
+def fail(msg, code=EXIT_ERROR):
+    log("moodle: " + msg)
+    sys.exit(code)
 
 
 # ---- token ----------------------------------------------------------------------------------------------------
@@ -114,18 +142,21 @@ def read_token():
     global _token_cache
     if _token_cache:
         return _token_cache
+    if os.environ.get("MOODLE_TOKEN", "").strip():             # e.g. from a systemd EnvironmentFile on a server
+        _token_cache = os.environ["MOODLE_TOKEN"].strip()
+        return _token_cache
     cmd = os.environ.get("MOODLE_TOKEN_CMD")                 # e.g. 'rbw get "TGM Moodle token"'
     if cmd:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         if r.returncode == 0 and r.stdout.strip():
             _token_cache = r.stdout.strip()
             return _token_cache
-        fail("MOODLE_TOKEN_CMD failed")
+        fail("MOODLE_TOKEN_CMD failed (exit %d)" % r.returncode, EXIT_TOKEN)
     try:
         _token_cache = open(TOKEN_FILE).read().strip()
         return _token_cache
     except OSError:
-        fail("no token yet: run `moodle token` once (in a normal terminal)")
+        fail("no token yet: run `moodle token` once (in a normal terminal)", EXIT_TOKEN)
 
 
 def parse_token(raw, passport):
@@ -137,7 +168,10 @@ def parse_token(raw, passport):
     if not m:
         fail("that's neither a token nor a moodlemobile://token=… link")
     b64 = m.group(1).replace("-", "+").replace("_", "/")
-    parts = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode().split(":::")
+    try:
+        parts = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode().split(":::")
+    except ValueError:                                          # binascii.Error, UnicodeDecodeError
+        fail("the link is damaged (copy the whole location header)")
     if len(parts) < 2:
         fail("the link doesn't contain a token")
     if passport and parts[0] != hashlib.md5((SITE + passport).encode()).hexdigest():
@@ -156,8 +190,9 @@ def cmd_token(a):
           "   with status 302, and copy the value of its 'location' response header (moodlemobile://token=…).\n"
           "   Paste it only here, not in a chat: it works like a password for your Moodle account.\n"
           "   Or: if %s/user/managetoken.php shows a 'Moodle mobile web service' key, copy that key.\n" % (url, SITE))
+    global _token_cache
     raw = getpass.getpass("4. Paste the link or the key (hidden): ")
-    token = parse_token(raw, passport)
+    token = _token_cache = parse_token(raw, passport)           # cached so redact() knows it from here on
     info = call("core_webservice_get_site_info", token=token)
     os.makedirs(CONF, mode=0o700, exist_ok=True)
     fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -181,26 +216,35 @@ def flatten(prefix, v, out):
 
 
 def call(fn, token=None, **args):
+    """One web-service call. Raises TokenError, NetworkError (after retries) or MoodleError; never shows the token."""
     data = [("wstoken", token or read_token()), ("wsfunction", fn), ("moodlewsrestformat", "json")]
     for k, v in args.items():
         flatten(k, v, data)
     req = urllib.request.Request(SITE + "/webservice/rest/server.php", data=urllib.parse.urlencode(data).encode(),
                                  headers={"User-Agent": UA})
-    for attempt in range(3):
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        retry = True
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 raw = r.read().decode("utf-8", "replace")
             out = json.loads(raw)
             break
-        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as e:
-            if attempt == 2:
-                fail("can't reach %s: %s" % (SITE, e))
-            time.sleep(3 * (attempt + 1))
-    if isinstance(out, dict) and out.get("exception"):
-        code = out.get("errorcode") or ""
-        if code == "invalidtoken" or (code == "accessexception" and fn.startswith("core_")):
-            fail("Moodle refused the token (%s). Run `moodle token` again." % code)
-        raise MoodleError("%s: %s" % (fn, out.get("message") or code))
+        except urllib.error.HTTPError as e:
+            why, retry = "HTTP %d" % e.code, e.code in RETRY_HTTP
+        except urllib.error.URLError as e:
+            why = e.reason
+        except (OSError, http.client.HTTPException) as e:       # timeouts, resets, cut-off answers
+            why = "%s %s" % (type(e).__name__, e)
+        except ValueError:
+            why = "the answer isn't JSON (maintenance page?)"
+        if not retry or attempt == len(RETRY_DELAYS):
+            raise NetworkError("can't reach %s: %s" % (SITE, redact(why)), "network")
+        time.sleep(RETRY_DELAYS[attempt])
+    if isinstance(out, dict) and (out.get("exception") or ("errorcode" in out and "error" in out)):
+        code = out.get("errorcode") or "unknown"
+        if code in TOKEN_ERRORS or (code == "accessexception" and fn.startswith("core_")):
+            raise TokenError("Moodle refused the token (%s). Run `moodle token` again." % code, code)
+        raise MoodleError("%s: %s" % (fn, redact(out.get("message") or out.get("error") or code)), code)
     return out
 
 
@@ -554,6 +598,8 @@ def submissions_enabled_in_configs(configs):
 def status_of(assign_id, subs_enabled=True):
     try:
         s = call("mod_assign_get_submission_status", assignid=assign_id)
+    except (TokenError, NetworkError):
+        raise
     except MoodleError as e:
         log("  note: status unavailable for assign %d (%s)" % (assign_id, e))
         return {"state": "?" if subs_enabled else "none", "graded": False, "grade": None,
@@ -1233,9 +1279,14 @@ def main():
     try:
         a.fn(a)
     except MoodleError as e:
-        fail(str(e))
+        fail(str(e), e.exit_code)
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception as e:                                      # a bug: say what, but never with the token in it
+        if os.environ.get("MOODLE_DEBUG"):
+            import traceback
+            log(traceback.format_exc())
+        fail("unexpected %s: %s" % (type(e).__name__, e))
 
 
 if __name__ == "__main__":
