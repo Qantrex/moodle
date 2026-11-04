@@ -13,6 +13,7 @@ Read-only towards Moodle: it never submits, uploads or changes anything there.
 """
 import argparse
 import base64
+import copy
 import getpass
 import hashlib
 import html
@@ -159,10 +160,13 @@ def read_token():
             return _token_cache
         fail("MOODLE_TOKEN_CMD failed (exit %d)" % r.returncode, EXIT_TOKEN)
     try:
-        _token_cache = open(TOKEN_FILE).read().strip()
-        return _token_cache
+        with open(TOKEN_FILE) as f:
+            _token_cache = f.read().strip()
     except OSError:
+        _token_cache = None
+    if not _token_cache:
         fail("no token yet: run `moodle token` once (in a normal terminal)", EXIT_TOKEN)
+    return _token_cache
 
 
 def parse_token(raw, passport):
@@ -727,9 +731,25 @@ def current(course):
     return not end or end > now_ts() - 30 * 86400            # running, or ended less than a month ago
 
 
+_run_cache = {}
+WORKERS = 4                                                     # parallel API calls: few, to stay polite
+
+
+def cached_call(fn, **args):
+    """call(), but each (function, arguments) only once per run: site info and the course list are needed by
+    several steps."""
+    key = (fn, json.dumps(args, sort_keys=True))
+    if key not in _run_cache:
+        _run_cache[key] = call(fn, **args)
+    return copy.deepcopy(_run_cache[key])
+
+
+def site_info():
+    return cached_call("core_webservice_get_site_info")
+
+
 def courses(all_years=False):
-    me = call("core_webservice_get_site_info")
-    cs = call("core_enrol_get_users_courses", userid=me["userid"])
+    cs = cached_call("core_enrol_get_users_courses", userid=site_info()["userid"])
     overrides = {}
     try:
         with open(SUBJECTS_FILE, encoding="utf-8") as f:
@@ -819,7 +839,7 @@ def enrich_status(items):
     if not items:
         return items
     read_token()                                                # warm token cache before spawning threads
-    with ThreadPoolExecutor(max_workers=min(6, len(items))) as ex:
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(items))) as ex:
         sts = list(ex.map(lambda a: status_of(a["id"], a["subs_enabled"]), items))
     for a, st in zip(items, sts):
         a.update(state=st["state"], graded=st["graded"], grade=st["grade"],

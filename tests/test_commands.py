@@ -2,11 +2,13 @@
 import base64
 import json
 import os
+import time
 import unittest
 
 from base import MoodleCase
 from fakemoodle import PDF, TOKEN
 
+REAL_SLEEP = time.sleep
 TASK = os.path.join("notes", "SEW", "Aufgabe 1 - REST API")
 NOTE = os.path.join(TASK, "Aufgabe 1 - REST API.md")
 WORK = os.path.join("files", "SEW", "Aufgabe 1 - REST API")
@@ -208,3 +210,37 @@ class Links(MoodleCase):
             self.m.parse_cmid("https://x.invalid/course/view.php?id=11")
         with self.assertRaises(SystemExit):
             self.m.parse_cmid("no number here")
+
+
+class Caching(MoodleCase):
+    def test_site_info_and_courses_once_per_run(self):
+        from fakemoodle import online
+        with online(self.m, self.fake):
+            self.m.courses()
+            self.m.courses(all_years=True)
+            self.m.assignments()
+        self.assertEqual(len(self.fake.calls_to("core_webservice_get_site_info")), 1)
+        self.assertEqual(len(self.fake.calls_to("core_enrol_get_users_courses")), 1)
+
+    def test_few_parallel_status_calls(self):
+        import threading
+        real_sleep = REAL_SLEEP
+        active, peak, lock = [0], [0], threading.Lock()
+        real = self.fake.answer
+
+        def slow(fn, p):
+            if fn == "mod_assign_get_submission_status":
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                real_sleep(0.05)
+                with lock:
+                    active[0] -= 1
+            return real(fn, p)
+        for i in range(10):
+            self.fake.assigns[11].append({"id": 500 + i, "cmid": 5000 + i, "name": "Extra %d" % i, "duedate": 0,
+                                          "configs": [], "intro": ""})
+        self.fake.answer = slow
+        self.run_cli("list")
+        self.assertLessEqual(peak[0], self.m.WORKERS)
+        self.assertGreater(peak[0], 1)
