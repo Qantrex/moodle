@@ -4,6 +4,9 @@
   moodle token                one-time setup: get a personal token through TGM single sign-on (no password here)
   moodle courses              enrolled courses and the subject each one maps to
   moodle list [--all]         open assignments (dated + undated): due date, subject, submission status
+  moodle due [--days N]       what still needs doing, by deadline (--json: stable output for scripts and agents)
+  moodle grades [--days N]    recent grades and teacher feedback (--json)
+  moodle doctor               check config, token and site without showing the token
   moodle show <link|id>       one assignment in full (description, attachments, submission, grade, feedback)
   moodle add <link|id> [...]  set up <notes>/<subject>/<Task Name>/ + <files>/<subject>/<Task Name>/
   moodle sync                 refresh existing tracker notes in <notes>/ (never bulk-creates folders)
@@ -13,23 +16,27 @@ Read-only towards Moodle: it never submits, uploads or changes anything there.
 """
 import argparse
 import base64
+import copy
 import getpass
 import hashlib
 import html
 import html.parser
+import http.client
 import json
 import os
 import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SITE = os.environ.get("MOODLE_URL", "https://elearning.tgm.ac.at").rstrip("/")
 CONF = os.path.expanduser(os.environ.get("MOODLE_CONFIG", "~/.config/moodle"))
@@ -52,7 +59,39 @@ def load_config():
 CONFIG = load_config()
 NOTES = os.path.expanduser(os.environ.get("MOODLE_NOTES") or CONFIG.get("notes") or "~/.local/share/moodle/notes")
 FILES = os.path.expanduser(os.environ.get("MOODLE_FILES") or CONFIG.get("files") or "~/.local/share/moodle/files")
+STATE = os.path.expanduser(os.environ.get("MOODLE_STATE")
+                           or os.path.join(os.environ.get("XDG_STATE_HOME") or "~/.local/state", "moodle"))
+MAX_DOWNLOAD = int(float(os.environ.get("MOODLE_MAX_MB") or CONFIG.get("max_download_mb") or 100) * 2 ** 20)
 UA = "moodle-cli (personal, read-only)"
+
+
+def load_tz():
+    """Due dates are shown in the school's time zone, not the machine's (a server or CI may run in UTC)."""
+    name = os.environ.get("MOODLE_TZ") or CONFIG.get("timezone") or "Europe/Vienna"
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        print("moodle: unknown time zone %r, using the machine's" % name, file=sys.stderr)
+        return None
+
+
+TZ = load_tz()
+
+
+def now_ts():
+    """The current time; MOODLE_NOW (ISO 8601) pins it for tests."""
+    pinned = os.environ.get("MOODLE_NOW")
+    if pinned:
+        return datetime.fromisoformat(pinned).timestamp()
+    return time.time()
+
+
+def local(ts):
+    return datetime.fromtimestamp(ts, TZ)
+
+
+def today():
+    return local(now_ts()).date()
 
 # subject code -> words that identify its courses (code itself always counts)
 SUBJECTS = {
@@ -64,18 +103,47 @@ SUBJECTS = {
 }
 
 _token_cache = None
+UMASK = os.umask(0o022)
+os.umask(UMASK)
+TIMEOUT = float(os.environ.get("MOODLE_TIMEOUT") or 30)         # seconds per API call
+RETRY_DELAYS = tuple(float(x) for x in (os.environ.get("MOODLE_RETRY_DELAYS") or "2,5").split(",") if x.strip())
+RETRY_HTTP = {429, 500, 502, 503, 504}                          # worth another try; other HTTP errors aren't
+TOKEN_ERRORS = {"invalidtoken", "invalidtokenexpired"}
+EXIT_ERROR, EXIT_TOKEN, EXIT_NETWORK = 1, 2, 3
 
 
 class MoodleError(Exception):
-    pass
+    """Moodle answered with an error. code is Moodle's errorcode (or ours: network, token, …)."""
+    exit_code = EXIT_ERROR
+
+    def __init__(self, msg, code="error"):
+        super().__init__(msg)
+        self.code = code
+
+
+class TokenError(MoodleError):
+    exit_code = EXIT_TOKEN
+
+
+class NetworkError(MoodleError):
+    exit_code = EXIT_NETWORK
+
+
+def redact(s):
+    """Never let the token reach the terminal, a log or a note, even inside an error message."""
+    s = str(s)
+    if _token_cache and len(_token_cache) >= 8:
+        s = s.replace(_token_cache, "***")
+    return re.sub(r"((?:ws)?token=)[A-Za-z0-9+/=_%-]{8,}", r"\1***", s)
 
 
 def log(*a):
-    print(*a, file=sys.stderr)
+    print(*(redact(x) for x in a), file=sys.stderr)
 
 
-def fail(msg):
-    sys.exit("moodle: " + msg)
+def fail(msg, code=EXIT_ERROR):
+    log("moodle: " + msg)
+    sys.exit(code)
 
 
 # ---- token ----------------------------------------------------------------------------------------------------
@@ -84,18 +152,24 @@ def read_token():
     global _token_cache
     if _token_cache:
         return _token_cache
+    if os.environ.get("MOODLE_TOKEN", "").strip():             # e.g. from a systemd EnvironmentFile on a server
+        _token_cache = os.environ["MOODLE_TOKEN"].strip()
+        return _token_cache
     cmd = os.environ.get("MOODLE_TOKEN_CMD")                 # e.g. 'rbw get "TGM Moodle token"'
     if cmd:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         if r.returncode == 0 and r.stdout.strip():
             _token_cache = r.stdout.strip()
             return _token_cache
-        fail("MOODLE_TOKEN_CMD failed")
+        fail("MOODLE_TOKEN_CMD failed (exit %d)" % r.returncode, EXIT_TOKEN)
     try:
-        _token_cache = open(TOKEN_FILE).read().strip()
-        return _token_cache
+        with open(TOKEN_FILE) as f:
+            _token_cache = f.read().strip()
     except OSError:
-        fail("no token yet: run `moodle token` once (in a normal terminal)")
+        _token_cache = None
+    if not _token_cache:
+        fail("no token yet: run `moodle token` once (in a normal terminal)", EXIT_TOKEN)
+    return _token_cache
 
 
 def parse_token(raw, passport):
@@ -107,7 +181,10 @@ def parse_token(raw, passport):
     if not m:
         fail("that's neither a token nor a moodlemobile://token=… link")
     b64 = m.group(1).replace("-", "+").replace("_", "/")
-    parts = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode().split(":::")
+    try:
+        parts = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode().split(":::")
+    except ValueError:                                          # binascii.Error, UnicodeDecodeError
+        fail("the link is damaged (copy the whole location header)")
     if len(parts) < 2:
         fail("the link doesn't contain a token")
     if passport and parts[0] != hashlib.md5((SITE + passport).encode()).hexdigest():
@@ -126,8 +203,9 @@ def cmd_token(a):
           "   with status 302, and copy the value of its 'location' response header (moodlemobile://token=…).\n"
           "   Paste it only here, not in a chat: it works like a password for your Moodle account.\n"
           "   Or: if %s/user/managetoken.php shows a 'Moodle mobile web service' key, copy that key.\n" % (url, SITE))
+    global _token_cache
     raw = getpass.getpass("4. Paste the link or the key (hidden): ")
-    token = parse_token(raw, passport)
+    token = _token_cache = parse_token(raw, passport)           # cached so redact() knows it from here on
     info = call("core_webservice_get_site_info", token=token)
     os.makedirs(CONF, mode=0o700, exist_ok=True)
     fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -151,46 +229,175 @@ def flatten(prefix, v, out):
 
 
 def call(fn, token=None, **args):
+    """One web-service call. Raises TokenError, NetworkError (after retries) or MoodleError; never shows the token."""
     data = [("wstoken", token or read_token()), ("wsfunction", fn), ("moodlewsrestformat", "json")]
     for k, v in args.items():
         flatten(k, v, data)
     req = urllib.request.Request(SITE + "/webservice/rest/server.php", data=urllib.parse.urlencode(data).encode(),
                                  headers={"User-Agent": UA})
-    for attempt in range(3):
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        retry = True
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 raw = r.read().decode("utf-8", "replace")
             out = json.loads(raw)
             break
-        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as e:
-            if attempt == 2:
-                fail("can't reach %s: %s" % (SITE, e))
-            time.sleep(3 * (attempt + 1))
-    if isinstance(out, dict) and out.get("exception"):
-        code = out.get("errorcode") or ""
-        if code == "invalidtoken" or (code == "accessexception" and fn.startswith("core_")):
-            fail("Moodle refused the token (%s). Run `moodle token` again." % code)
-        raise MoodleError("%s: %s" % (fn, out.get("message") or code))
+        except urllib.error.HTTPError as e:
+            why, retry = "HTTP %d" % e.code, e.code in RETRY_HTTP
+        except urllib.error.URLError as e:
+            why = e.reason
+        except (OSError, http.client.HTTPException) as e:       # timeouts, resets, cut-off answers
+            why = "%s %s" % (type(e).__name__, e)
+        except ValueError:
+            why = "the answer isn't JSON (maintenance page?)"
+        if not retry or attempt == len(RETRY_DELAYS):
+            raise NetworkError("can't reach %s: %s" % (SITE, redact(why)), "network")
+        time.sleep(RETRY_DELAYS[attempt])
+    if isinstance(out, dict) and (out.get("exception") or ("errorcode" in out and "error" in out)):
+        code = out.get("errorcode") or "unknown"
+        if code in TOKEN_ERRORS or (code == "accessexception" and fn.startswith("core_")):
+            raise TokenError("Moodle refused the token (%s). Run `moodle token` again." % code, code)
+        raise MoodleError("%s: %s" % (fn, redact(out.get("message") or out.get("error") or code)), code)
     return out
 
 
-def download(url, dest, token, mtime=None):
+class DownloadError(Exception):
+    pass
+
+
+def download(url, dest, token, mtime=None, size=None):
+    """Fetch one attachment into dest (atomically). The token only ever goes to SITE, and no error names the URL."""
+    if not url.startswith(SITE + "/"):
+        raise DownloadError("not on %s, skipped (the token only goes to Moodle)" % SITE)
+    if size and int(size) > MAX_DOWNLOAD:
+        raise DownloadError("%.0f MB, over the %d MB limit (MOODLE_MAX_MB)" % (int(size) / 2 ** 20, MAX_DOWNLOAD >> 20))
+    url = urllib.parse.quote(url, safe=":/?&=%#+@,;~!$'()*[]")    # spaces etc. would make urllib raise with the URL
     sep = "&" if "?" in url else "?"
-    req = urllib.request.Request(url + sep + "token=" + token, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        body = r.read()
-    if body[:1] == b"{" and b'"errorcode"' in body[:200]:
-        raise OSError(json.loads(body).get("message", "download refused"))
+    req = urllib.request.Request(url + sep + urllib.parse.urlencode({"token": token}), headers={"User-Agent": UA})
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = dest + ".part"
-    with open(tmp, "wb") as f:
-        f.write(body)
-    os.replace(tmp, dest)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), prefix=".", suffix=".part")
+    try:
+        try:
+            with os.fdopen(fd, "wb") as f, urllib.request.urlopen(req, timeout=60) as r:
+                length = r.headers.get("Content-Length")
+                if length and length.isdigit() and int(length) > MAX_DOWNLOAD:
+                    raise DownloadError("over the %d MB limit (MOODLE_MAX_MB)" % (MAX_DOWNLOAD >> 20))
+                head, total = b"", 0
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD:
+                        raise DownloadError("over the %d MB limit (MOODLE_MAX_MB)" % (MAX_DOWNLOAD >> 20))
+                    if len(head) < 512:
+                        head += chunk[:512]
+                    f.write(chunk)
+        except urllib.error.HTTPError as e:
+            raise DownloadError("HTTP %d" % e.code) from None
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise DownloadError(redact("%s %s" % (type(e).__name__, getattr(e, "reason", e)))) from None
+        if head.lstrip()[:1] == b"{" and b'"errorcode"' in head and total < 1 << 16:
+            try:
+                with open(tmp, "rb") as f:
+                    err = json.load(f)
+            except ValueError:
+                err = None
+            if isinstance(err, dict) and err.get("errorcode"):
+                raise DownloadError(redact(err.get("error") or err.get("message") or err["errorcode"]))
+        os.chmod(tmp, 0o666 & ~UMASK)
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     if mtime:
         try:
-            os.utime(dest, (mtime, mtime))
+            os.utime(dest, (int(mtime), int(mtime)))
         except OSError:
             pass
+
+
+class Downloads:
+    """Remembers what was downloaded where (STATE/downloads.json), so a sync never overwrites a file you edited
+    and doesn't fetch an unchanged attachment again."""
+
+    def __init__(self):
+        self.path = os.path.join(STATE, "downloads.json")
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                self.seen = json.load(f)
+        except (OSError, ValueError):
+            self.seen = {}
+        self.dirty = False
+
+    @staticmethod
+    def remote(f):
+        return int(f.get("timemodified") or 0), int(f.get("filesize") if f.get("filesize") is not None else -1)
+
+    def plan(self, dest, f):
+        """'get' (missing or replaced in Moodle), 'skip' (up to date or your own edit, Moodle unchanged)
+        or 'beside' (Moodle has a new version but the local file was edited: keep it, save the new one next to it)."""
+        if not os.path.exists(dest):
+            return "get"
+        st = os.stat(dest)
+        tm, size = self.remote(f)
+        rec = self.seen.get(os.path.abspath(dest))
+        if rec:
+            untouched = rec["lsize"] == st.st_size and rec["lmtime"] == int(st.st_mtime)
+            same = (rec["tm"], rec["size"]) == (tm, size)
+            return "skip" if same else ("get" if untouched else "beside")
+        # No record (older versions, or a file that was already there). Older versions set mtime := timemodified.
+        ours = tm and abs(int(st.st_mtime) - tm) <= 1
+        if size < 0 or st.st_size == size:
+            self.remember(dest, f)
+            return "skip"
+        return "get" if ours else "beside"
+
+    def remember(self, dest, f):
+        st = os.stat(dest)
+        tm, size = self.remote(f)
+        self.seen[os.path.abspath(dest)] = {"tm": tm, "size": size, "lsize": st.st_size, "lmtime": int(st.st_mtime)}
+        self.dirty = True
+
+    def save(self):
+        if self.dirty:
+            write_atomic(self.path, json.dumps(self.seen, indent=0, sort_keys=True) + "\n")
+            self.dirty = False
+
+
+def beside_name(fname, f):
+    stem, ext = os.path.splitext(fname)
+    return "%s (Moodle %s)%s" % (stem, day(int(f.get("timemodified") or now_ts())), ext)
+
+
+def read_text(path):
+    """A note's text, or None (with a warning) if it isn't UTF-8: such a file is never rewritten."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        log("  skipping %s: not UTF-8" % path)
+        return None
+
+
+def write_atomic(path, text):
+    """Write via a temp file + rename, so a crash or a syncing vault never sees a half-written file."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o666 & ~UMASK
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".", suffix=".moodle-tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 # ---- HTML -> Markdown -----------------------------------------------------------------------------------------
@@ -209,6 +416,8 @@ HTML_TAGS = {
 def browser_url(u):
     """Turn token-gated /webservice/pluginfile.php links into regular SSO /pluginfile.php links."""
     u = (u or "").strip()
+    u = re.sub(r"([?&])(?:ws)?token=[^&#]*(&|(?=#)|$)", lambda m: m.group(1) if m.group(2) else "", u)
+    u = re.sub(r"[?&](?=#|$)", "", u)                            # never copy a token into a note
     return u.replace(SITE + "/webservice/pluginfile.php/", SITE + "/pluginfile.php/")
 
 
@@ -219,12 +428,13 @@ class _MDParser(html.parser.HTMLParser):
         self.skip = 0
         self.pre = 0
         self.code = 0
-        self.lists = []          # [["ul", 0], ["ol", 2], ...]
+        self.lists = []          # [["ul", items so far, inside an <li>], ["ol", 2, True], ...]
         self.in_li = 0
         self.li_has_text = False
         self.links = []          # [(href, start_idx)]
         self.marks = []          # [(marker, start_idx, active)]
         self.table = None        # rows: [[cell_str, ...], ...]
+        self.tables = 0          # nesting depth: inner tables are flattened into the outer cell
         self.cell = None         # list of chunks when inside td/th
 
     def _buf(self):
@@ -331,13 +541,16 @@ class _MDParser(html.parser.HTMLParser):
                 self._open_mark("`")
         elif t in ("ul", "ol"):
             self._nl(1 if self.lists else 2)
-            self.lists.append([t, 0])
+            self.lists.append([t, 0, False])
         elif t == "li":
             self._nl(1)
             if not self.lists:
-                self.lists.append(["ul", 0])
+                self.lists.append(["ul", 0, False])
+            if self.lists[-1][2]:                               # <li> without </li> before the next one
+                self.in_li = max(0, self.in_li - 1)
             self.lists[-1][1] += 1
-            kind, num = self.lists[-1]
+            self.lists[-1][2] = True
+            kind, num, _ = self.lists[-1]
             indent = "  " * (len(self.lists) - 1)
             self._emit("%s%s" % (indent, ("%d. " % num) if kind == "ol" else "- "))
             self.in_li += 1
@@ -347,17 +560,31 @@ class _MDParser(html.parser.HTMLParser):
         elif t == "img":
             src = browser_url(at.get("src"))
             alt = (at.get("alt") or "").strip()
-            if src:
+            if src.startswith("data:"):                         # a pasted screenshot: megabytes of base64
+                self._emit("*(image%s)*" % (": " + alt if alt else ""))
+            elif src:
                 self._emit("![%s](%s)" % (alt, src))
         elif t == "table":
-            if self.table is None:
+            self.tables += 1
+            if self.tables == 1:
+                self._end_cell()
                 self._nl(2)
                 self.table = []
+            else:
+                self._emit(" ")
         elif t == "tr":
-            if self.table is not None:
+            if self.tables > 1:
+                self._emit(" ")
+            elif self.table is not None:
+                self._end_cell()
                 self.table.append([])
         elif t in ("td", "th"):
-            if self.table is not None and self.table:
+            if self.tables > 1:
+                self._emit(" ")
+            elif self.table is not None:
+                self._end_cell()                                # </td> is optional in HTML
+                if not self.table:
+                    self.table.append([])
                 self.cell = []
 
     def handle_endtag(self, tag):
@@ -393,10 +620,14 @@ class _MDParser(html.parser.HTMLParser):
                 self._close_mark("`")
         elif t in ("ul", "ol"):
             if self.lists:
+                if self.lists[-1][2]:
+                    self.in_li = max(0, self.in_li - 1)
                 self.lists.pop()
             self._nl(1 if self.lists else 2)
         elif t == "li":
-            self.in_li = max(0, self.in_li - 1)
+            if self.lists and self.lists[-1][2]:
+                self.lists[-1][2] = False
+                self.in_li = max(0, self.in_li - 1)
             self._nl(1)
         elif t == "a":
             if self.links:
@@ -411,12 +642,12 @@ class _MDParser(html.parser.HTMLParser):
                 else:
                     b.append("[%s](%s)" % (label, href))
         elif t in ("td", "th"):
-            if self.cell is not None and self.table:
-                txt = re.sub(r"\s+", " ", "".join(self.cell)).strip().replace("|", r"\|")
-                self.table[-1].append(txt)
-                self.cell = None
+            if self.tables == 1:
+                self._end_cell()
         elif t == "table":
-            if self.table is not None:
+            self.tables = max(0, self.tables - 1)
+            if self.tables == 0 and self.table is not None:
+                self._end_cell()
                 rows = [r for r in self.table if any(r)]
                 self.table = None
                 if rows:
@@ -425,6 +656,18 @@ class _MDParser(html.parser.HTMLParser):
                     lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * cols]
                     lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
                     self._emit("\n".join(lines) + "\n\n")
+
+    def _end_cell(self):
+        if self.cell is not None and self.table:
+            txt = re.sub(r"\s+", " ", "".join(self.cell)).strip().replace("|", r"\|")
+            self.table[-1].append(txt)
+        self.cell = None
+
+    def close(self):
+        super().close()
+        if self.table is not None:                              # unclosed table at the end: keep its text
+            self.tables = 1
+            self.handle_endtag("table")
 
     def handle_data(self, data):
         if self.skip or not data:
@@ -457,37 +700,80 @@ def text_of(htm):
 # ---- data -----------------------------------------------------------------------------------------------------
 
 def subject_of(course, overrides):
-    for key in (course.get("shortname", ""), course.get("fullname", "")):
+    """Subject code of a course: an override, else the code in the short name, else the subject's name,
+    else an upper-case code in the full name. Plain words like "am" or "E-Learning" don't count as AM or E."""
+    short, full = course.get("shortname") or "", course.get("fullname") or ""
+    lower = {k.lower(): v for k, v in overrides.items()}
+    for key in (short, full):
         if key in overrides:
-            return overrides[key]
-    text = ("%s %s" % (course.get("shortname", ""), course.get("fullname", ""))).lower()
-    for code, words in SUBJECTS.items():
-        if re.search(r"(?<![a-z])%s(?![a-z])" % code.lower(), text) or any(re.search(w, text) for w in words):
-            return code
-    return None
+            return overrides[key] or None                       # "": ignore this course
+        if key.lower() in lower:
+            return lower[key.lower()] or None
+
+    def code_in(text, flags=0):
+        return next((c for c in SUBJECTS
+                     if re.search(r"(?<![A-Za-zÄÖÜäöü])%s(?![A-Za-zÄÖÜäöü]|-[A-Za-z])" % c, text, flags)), None)
+
+    text = ("%s %s" % (short, full)).lower()
+    return (code_in(short, re.I)
+            or next((c for c, ws in SUBJECTS.items() if any(re.search(w, text) for w in ws)), None)
+            or code_in(full))
 
 
 def school_year(course):
-    m = re.search(r"\b(\d{2})\s*/\s*(\d{2})\b", course.get("fullname", "") + " " + course.get("shortname", ""))
-    if m:
-        return "20%s-%s" % (m.group(1), m.group(2))
-    t = datetime.fromtimestamp(course["startdate"]) if course.get("startdate") else datetime.now()
+    for m in re.finditer(r"\b(\d{2})\s*/\s*(\d{2})\b", course.get("fullname", "") + " " + course.get("shortname", "")):
+        if int(m.group(2)) == (int(m.group(1)) + 1) % 100:     # 26/27, not a date like 10/12
+            return "20%s-%s" % (m.group(1), m.group(2))
+    t = local(course["startdate"] if course.get("startdate") else now_ts())
     y = t.year if t.month >= 7 else t.year - 1                # courses set up in July/August belong to the new year
     return "%d-%02d" % (y, (y + 1) % 100)
 
 
 def current(course):
     end = course.get("enddate") or 0
-    return not end or end > time.time() - 30 * 86400            # running, or ended less than a month ago
+    return not end or end > now_ts() - 30 * 86400            # running, or ended less than a month ago
+
+
+_run_cache = {}
+WORKERS = 4                                                     # parallel API calls: few, to stay polite
+
+
+def cached_call(fn, **args):
+    """call(), but each (function, arguments) only once per run: site info and the course list are needed by
+    several steps."""
+    key = (fn, json.dumps(args, sort_keys=True))
+    if key not in _run_cache:
+        _run_cache[key] = call(fn, **args)
+    return copy.deepcopy(_run_cache[key])
+
+
+def site_info():
+    return cached_call("core_webservice_get_site_info")
+
+
+_overrides = None
+
+
+def subject_overrides():
+    global _overrides
+    if _overrides is None:
+        _overrides = {}
+        try:
+            with open(SUBJECTS_FILE, encoding="utf-8") as f:
+                _overrides = json.load(f)
+            if not isinstance(_overrides, dict):
+                raise ValueError("not a {\"course\": \"SUBJECT\"} object")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log("moodle: ignoring %s: %s" % (SUBJECTS_FILE, e))
+            _overrides = {}
+    return _overrides
 
 
 def courses(all_years=False):
-    me = call("core_webservice_get_site_info")
-    cs = call("core_enrol_get_users_courses", userid=me["userid"])
-    try:
-        overrides = json.load(open(SUBJECTS_FILE))
-    except (OSError, ValueError):
-        overrides = {}
+    cs = cached_call("core_enrol_get_users_courses", userid=site_info()["userid"])
+    overrides = subject_overrides()
     out = []
     for c in cs:
         if not all_years and not current(c):
@@ -504,9 +790,12 @@ def merge_files(*lists):
         for f in lst or []:
             if not isinstance(f, dict) or not f.get("filename") or not f.get("fileurl"):
                 continue
-            key = (os.path.basename(f["filename"]), f["fileurl"])
-            if key not in seen:
-                seen.add(key)
+            name = os.path.basename(f["filename"])
+            keys = {(name, f["fileurl"])}
+            if f.get("filesize") is not None and f.get("timemodified"):
+                keys.add((name, f["filesize"], f["timemodified"]))     # same file listed under another URL
+            if not keys & seen:
+                seen |= keys
                 out.append(f)
     return out
 
@@ -524,6 +813,8 @@ def submissions_enabled_in_configs(configs):
 def status_of(assign_id, subs_enabled=True):
     try:
         s = call("mod_assign_get_submission_status", assignid=assign_id)
+    except (TokenError, NetworkError):
+        raise
     except MoodleError as e:
         log("  note: status unavailable for assign %d (%s)" % (assign_id, e))
         return {"state": "?" if subs_enabled else "none", "graded": False, "grade": None,
@@ -561,7 +852,7 @@ def enrich_status(items):
     if not items:
         return items
     read_token()                                                # warm token cache before spawning threads
-    with ThreadPoolExecutor(max_workers=min(6, len(items))) as ex:
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(items))) as ex:
         sts = list(ex.map(lambda a: status_of(a["id"], a["subs_enabled"]), items))
     for a, st in zip(items, sts):
         a.update(state=st["state"], graded=st["graded"], grade=st["grade"],
@@ -600,11 +891,11 @@ def assignments(all_years=False, with_status=True):
 
 
 def day(ts):
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
+    return local(ts).strftime("%Y-%m-%d") if ts else ""
 
 
 def when(ts):
-    return datetime.fromtimestamp(ts).strftime("%a %d.%m.%Y %H:%M") if ts else "no due date"
+    return local(ts).strftime("%a %d.%m.%Y %H:%M") if ts else "no due date"
 
 
 FAIL_GRADE = re.compile(
@@ -646,13 +937,22 @@ TEMPLATE_TODO = re.compile(
 )
 
 
-def task_name(name):
-    """Exact task name, sanitizing only bytes forbidden by Linux paths or Obsidian LiveSync (\\/:*?\"<>|#)."""
-    s = re.sub(r"[\x00-\x1f]+", "", name)
+MAX_NAME = 120                                                  # characters; file systems stop at 255 bytes
+
+
+def task_name(name, fallback="Assignment", keep_ext=False):
+    """Exact task name, sanitizing only what Linux paths or Obsidian LiveSync forbid (\\/:*?\"<>|#), plus what
+    breaks syncing: a leading dot (hidden: sync would never find the note again), trailing dots, overlong names."""
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", name)
     s = re.sub(r"\s*:\s*", " - ", s).replace('"', "'").replace("/", "-")
     s = re.sub(r"[\\?<>|*#]+", "", s)
-    s = re.sub(r"  +", " ", s).strip()
-    return s if s not in ("", ".", "..") else "Assignment"
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > MAX_NAME:
+        stem, ext = os.path.splitext(s) if keep_ext else (s, "")
+        ext = ext if len(ext) <= 10 else ""
+        s = stem[:MAX_NAME - len(ext)].rstrip() + ext
+    s = s.lstrip(". ").rstrip(". ")
+    return s or fallback
 
 
 def kind_of(a):
@@ -664,7 +964,7 @@ def yaml_val(v):
     if not s:
         return ""
     if (": " in s or " #" in s or s.endswith(":") or any(c in s for c in '"\\\n\r\t')
-            or s[0] in "[{*&!|>%@`?'\"-"):
+            or s[0] in "#[{*&!|>%@`?'\"-" or s != s.strip()):
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return s
 
@@ -726,7 +1026,7 @@ def existing_notes():
         for f in fs:
             if f.endswith(".md"):
                 p = os.path.join(d, f)
-                cm = props_of(open(p, encoding="utf-8").read()).get("moodle", "")
+                cm = props_of(read_text(p) or "").get("moodle", "")
                 if cm.isdigit():
                     out[int(cm)] = p
     return out
@@ -780,7 +1080,9 @@ def match_by_name(a, linked):
     c50 = {s.lower() for s in re.findall(r"classroom50\.org/[^\s)\"'>]+/assignments/([a-z0-9_-]+)", body, re.I)}
     best = None
     for p in candidate_tracker_notes(folder, linked):
-        text = open(p, encoding="utf-8").read()
+        text = read_text(p)
+        if text is None:
+            continue
         pr = props_of(text)
         if pr.get("moodle") or pr.get("type") not in ("assignment", "test"):
             continue
@@ -819,7 +1121,7 @@ def task_md_for(a):
              "- **Due:** %s" % when(a["due"])]
     if a["cutoff"] and a["cutoff"] != a["due"]:
         lines.append("- **Last chance (cut-off):** %s" % when(a["cutoff"]))
-    if a["opens"] and a["opens"] > time.time():
+    if a["opens"] and a["opens"] > now_ts():
         lines.append("- **Opens:** %s" % when(a["opens"]))
     if a["intro"]:
         lines += ["", "## Task", "", a["intro"]]
@@ -833,11 +1135,11 @@ def task_md_for(a):
 
 def block_for(a, dl_dir, saved, has_task_md=False):
     lines = ["## Moodle", "",
-             "*synced %s by `moodle sync`; edit outside this block*" % datetime.now().strftime("%Y-%m-%d %H:%M"), "",
+             "*synced %s by `moodle sync`; edit outside this block*" % local(now_ts()).strftime("%Y-%m-%d %H:%M"), "",
              "- **Link:** %s" % a["url"], "- **Course:** %s" % a["course"], "- **Due:** %s" % when(a["due"])]
     if a["cutoff"] and a["cutoff"] != a["due"]:
         lines.append("- **Last chance (cut-off):** %s" % when(a["cutoff"]))
-    if a["opens"] and a["opens"] > time.time():
+    if a["opens"] and a["opens"] > now_ts():
         lines.append("- **Opens:** %s" % when(a["opens"]))
     sub_label = "no online submission" if a.get("state") == "none" else a.get("state", "?")
     lines.append("- **Submission:** %s%s" % (sub_label, ", graded: %s" % a["grade"] if a.get("grade") else ""))
@@ -898,27 +1200,28 @@ def new_note(a, files_dir):
         yaml_line("due", day(a["due"])),
         yaml_line("files", files_dir),
         yaml_line("moodle", a["cmid"]),
-        yaml_line("updated", date.today().isoformat()),
+        yaml_line("updated", today().isoformat()),
     ])
     return "---\n%s\n---\n# %s\n\n> [!todo]\n%s\n" % (fm, heading_for(a), todo_for(a))
 
 
-def needs_download(dest, f):
-    if not os.path.exists(dest):
-        return True
-    if f.get("filesize") is not None:
-        try:
-            if os.path.getsize(dest) != int(f["filesize"]):
-                return True
-        except (OSError, ValueError):
-            pass
-    if f.get("timemodified"):
-        try:
-            if int(os.path.getmtime(dest)) < int(f["timemodified"]) - 1:
-                return True
-        except (OSError, ValueError):
-            pass
-    return False
+def is_git(d):
+    return bool(d) and os.path.exists(os.path.join(d, ".git"))
+
+
+def attachment_names(files):
+    """(local file name, file) pairs: names made safe like task names, and unique within the folder."""
+    used, out = set(), []
+    for f in files:
+        name = task_name(os.path.basename(f["filename"]), fallback="attachment", keep_ext=True)
+        stem, ext = os.path.splitext(name)
+        n = 2
+        while name.lower() in used:
+            name = "%s (%d)%s" % (stem, n, ext)
+            n += 1
+        used.add(name.lower())
+        out.append((name, f))
+    return out
 
 
 def pick_new_note_path(subject, name, cmid, claimed):
@@ -941,18 +1244,18 @@ def resolve_files_dir(x, is_existing, old_props, claimed_dirs, create_work_dir=F
         exact = "%s (%d)" % (exact, x["cmid"])
     existing_files = old_props.get("files", "").strip() if is_existing else ""
     if existing_files:
-        in_schule = os.path.abspath(existing_files).startswith(os.path.abspath(FILES) + os.sep)
-        is_git = os.path.exists(os.path.join(existing_files, ".git"))
-        if in_schule and not is_git:
-            claimed_dirs.add(existing_files)
-            return existing_files, (existing_files if os.path.isdir(existing_files) or not already_finished else None)
-        if x["files"] and (os.path.isdir(exact) or not already_finished):
+        where = os.path.abspath(os.path.expanduser(existing_files))
+        in_files = where.startswith(os.path.abspath(FILES) + os.sep)
+        if in_files and not is_git(where):
+            claimed_dirs.add(where)
+            return existing_files, (where if os.path.isdir(where) or not already_finished else None)
+        if x["files"] and not is_git(exact) and (os.path.isdir(exact) or not already_finished):
             claimed_dirs.add(exact)
             return existing_files, exact
         return existing_files, None
     if os.path.isdir(exact) or ((x["files"] or create_work_dir) and not already_finished):
         claimed_dirs.add(exact)
-        return exact, exact
+        return exact, (None if is_git(exact) else exact)          # a repo cloned there is yours: no downloads
     return "", None
 
 
@@ -960,8 +1263,8 @@ def sync_task_md(note_dir, x, dry_run):
     """Ensure TASK.md inside the vault's assignment folder holds the exact Moodle task description."""
     p = os.path.join(note_dir, "TASK.md")
     if os.path.exists(p):
-        old = open(p, encoding="utf-8").read()
-        if "<!-- moodle -->" not in old:
+        old = read_text(p)
+        if old is None or "<!-- moodle -->" not in old:
             return False
     else:
         old = None
@@ -969,15 +1272,17 @@ def sync_task_md(note_dir, x, dry_run):
     if old == content:
         return False
     if not dry_run:
-        os.makedirs(note_dir, exist_ok=True)
-        open(p, "w", encoding="utf-8").write(content)
+        write_atomic(p, content)
     return True
 
 
-def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=False, no_files=False, dry_run=False, how=""):
+def sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads, create_work_dir=False, no_files=False,
+             dry_run=False, how=""):
     """Write or update one assignment's note, TASK.md and working/attachment folder. Returns 'new'|'updated'|'unchanged'."""
     is_existing = bool(path and os.path.exists(path))
-    old_text = open(path, encoding="utf-8").read() if is_existing else ""
+    old_text = read_text(path) if is_existing else ""
+    if old_text is None:
+        return "unchanged"
     old_props = props_of(old_text) if is_existing else {}
     if not path:
         path = pick_new_note_path(x["subject"], x["name"], x["cmid"], claimed_notes)
@@ -994,17 +1299,23 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=
         os.makedirs(dl_dir, exist_ok=True)
 
     saved = []
-    for f in (x["files"] if dl_dir and not no_files else []):
-        fname = os.path.basename(f["filename"]).strip()
-        if not fname:
-            continue
+    for fname, f in attachment_names(x["files"] if dl_dir and not no_files else []):
         dest = os.path.join(dl_dir, fname)
-        if needs_download(dest, f) and not dry_run:
+        plan = downloads.plan(dest, f)
+        if plan == "beside":
+            fname = beside_name(fname, f)
+            dest = os.path.join(dl_dir, fname)
+            plan = downloads.plan(dest, f)
+            if plan == "get":
+                log("  %s was edited here and changed in Moodle: keeping yours, new one saved as %s" % (
+                    os.path.basename(dest), fname))
+        if plan == "get" and not dry_run:
             try:
-                download(f["fileurl"], dest, token, mtime=f.get("timemodified"))
-            except (OSError, urllib.error.URLError) as e:
+                download(f["fileurl"], dest, token, mtime=f.get("timemodified"), size=f.get("filesize"))
+            except DownloadError as e:
                 log("  can't download %s: %s" % (fname, e))
                 continue
+            downloads.remember(dest, f)
         saved.append(fname)
 
     task_changed = sync_task_md(note_dir, x, dry_run) if in_task_folder else False
@@ -1020,7 +1331,7 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=
         if done(x) and old_props.get("status") not in ("done", "dropped"):
             text = set_prop(text, "status", "done")
         text = sync_auto_todo(text, x)
-        text = set_prop(set_prop(text, "moodle", x["cmid"]), "updated", date.today().isoformat())
+        text = set_prop(set_prop(text, "moodle", x["cmid"]), "updated", today().isoformat())
     else:
         text = new_note(x, files_prop)
 
@@ -1034,13 +1345,14 @@ def sync_one(x, path, have, claimed_notes, claimed_dirs, token, create_work_dir=
     print("%s %-5s %-10s %-10s %s%s" % (verb, x["subject"], day(x["due"]) or "-", x.get("state", "?"),
                                         os.path.relpath(path, NOTES), how))
     if not dry_run:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "w", encoding="utf-8").write(text)
+        write_atomic(path, text)
     return "updated" if is_existing else "new"
 
 
 def parse_cmid(s):
-    m = re.search(r"id=(\d+)", s) or re.fullmatch(r"\s*(\d+)\s*", s)
+    if re.search(r"/(course|user|grade)/", s):
+        fail("that's not an assignment link (open the assignment and copy its link): %r" % s)
+    m = re.search(r"[?&](?:cm)?id=(\d+)", s) or re.fullmatch(r"\s*(\d+)\s*", s)
     if not m:
         fail("give an assignment link (…/mod/assign/view.php?id=N) or its id: %r" % s)
     return int(m.group(1))
@@ -1063,6 +1375,7 @@ def cmd_add(a):
     claimed_notes = set(have.values())
     claimed_dirs = set()
     token = read_token()
+    downloads = Downloads()
     counts = {"new": 0, "updated": 0, "unchanged": 0}
     skipped_done = 0
 
@@ -1079,9 +1392,11 @@ def cmd_add(a):
             skipped_done += 1
             log("skip (already finished/graded; pass --force to create anyway): %s" % x["name"])
             continue
-        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token,
+        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads,
                        create_work_dir=True, no_files=a.no_files, dry_run=a.dry_run, how=how)
         counts[res] += 1
+    if not a.dry_run:
+        downloads.save()
 
     log("%d new, %d updated, %d unchanged%s%s" % (
         counts["new"], counts["updated"], counts["unchanged"],
@@ -1094,6 +1409,9 @@ def cmd_sync(a):
     have = existing_notes()
     claimed_notes = set(have.values())
     matched = []
+    unmapped = sorted({x["course"] for x in raw if not x["subject"]})
+    if unmapped:
+        log("no subject for %s (add to %s to sync them)" % (", ".join(unmapped), SUBJECTS_FILE))
     for x in raw:
         if not x["subject"]:
             continue
@@ -1110,13 +1428,16 @@ def cmd_sync(a):
 
     enrich_status([x for x, _, _ in matched])
     token = read_token() if matched else ""
+    downloads = Downloads()
     claimed_dirs = set()
     counts = {"new": 0, "updated": 0, "unchanged": 0}
 
     for x, path, how in matched:
-        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token,
+        res = sync_one(x, path, have, claimed_notes, claimed_dirs, token, downloads,
                        create_work_dir=False, no_files=a.no_files, dry_run=a.dry_run, how=how)
         counts[res] += 1
+    if not a.dry_run:
+        downloads.save()
 
     log("%d updated, %d unchanged (tracked notes only; use `moodle add <id>` to create a new task folder)%s" % (
         counts["updated"], counts["unchanged"], " — dry run, nothing written" if a.dry_run else ""))
@@ -1134,7 +1455,7 @@ def cmd_list(a):
     if not a.all:
         items = [x for x in items if x["subject"] and not PLACEHOLDER.search(x["name"])
                  and (not a.dated or x["due"])
-                 and (not x["due"] or x["due"] > time.time() - 30 * 86400)]
+                 and (not x["due"] or x["due"] > now_ts() - 30 * 86400)]
     enrich_status(items)
     if not a.all:
         items = [x for x in items if not done(x)]
@@ -1142,7 +1463,7 @@ def cmd_list(a):
         print(json.dumps(items, ensure_ascii=False, indent=1))
         return
     for x in items:
-        late = x["due"] and x["due"] < time.time() and not done(x)
+        late = x["due"] and x["due"] < now_ts() and not done(x)
         state = "no-upload" if x.get("state") == "none" else x.get("state", "?")
         print("%-17s %-5s %-10s %s%s  %s" % (when(x["due"])[4:] if x["due"] else "–", x["subject"] or "?",
                                              state, "LATE " if late else "", x["name"][:60], x["url"]))
@@ -1173,6 +1494,242 @@ def cmd_show(a):
         print("\nInstructions:\n" + act)
 
 
+# ---- due: the timeline, for people and scripts -----------------------------------------------------------------
+
+DUE_SCHEMA = "moodle-due/1"
+DAY = 86400
+EVENTS_PAGE = 50                                                # Moodle's maximum per call
+
+
+def iso(ts):
+    return local(ts).isoformat(timespec="seconds") if ts else None
+
+
+def plain(s):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", str(s or ""))).replace("\xa0", " ")).strip()
+
+
+def action_events(frm, to):
+    """Everything with a deadline that still needs doing (the Moodle app's timeline), all pages of it."""
+    out, after = [], 0
+    for _ in range(40):
+        args = dict(timesortfrom=frm, timesortto=to, limitnum=EVENTS_PAGE)
+        if after:
+            args["aftereventid"] = after
+        page = (call("core_calendar_get_action_events_by_timesort", **args) or {}).get("events") or []
+        out += page
+        if len(page) < EVENTS_PAGE:
+            break
+        after = page[-1]["id"]
+    return out
+
+
+def due_items(days=14, past=14, everything=False):
+    n = int(now_ts())
+    items, seen = [], set()
+    for e in action_events(n - past * DAY, n + days * DAY):
+        if e.get("id") in seen:
+            continue
+        seen.add(e.get("id"))
+        c = e.get("course") or {}
+        name = plain(e.get("activityname") or e.get("name"))
+        if not everything and PLACEHOLDER.search(name):
+            continue
+        ts = int(e.get("timesort") or 0)
+        act = e.get("action") or {}
+        url = e.get("url") or ""
+        cm = re.search(r"[?&]id=(\d+)", url)
+        items.append({
+            "id": e.get("id"),
+            "cmid": int(cm.group(1)) if cm else None,
+            "module": e.get("modulename") or None,
+            "course": plain(c.get("shortname") or c.get("fullname")),
+            "subject": subject_of(c, subject_overrides()) if c else None,
+            "name": name,
+            "due": iso(ts),
+            "due_ts": ts,
+            "overdue": bool(e.get("overdue")) or ts < n,
+            "action": plain(act.get("name")) or None,
+            "url": browser_url(url) or None,
+        })
+    items.sort(key=lambda x: (x["due_ts"], x["course"], x["name"]))
+    return items
+
+
+# ---- grades ---------------------------------------------------------------------------------------------------
+
+GRADES_SCHEMA = "moodle-grades/1"
+
+
+def is_graded(g):
+    return g.get("graderaw") is not None or (g.get("gradeformatted") or "-").strip() not in ("", "-")
+
+
+def grade_items(days=30, everything=False):
+    """Graded activities of the current courses, newest first. One call per course, a few in parallel."""
+    uid = site_info()["userid"]
+    cs = [c for c in courses() if everything or c["subject"]]
+
+    def one(c):
+        try:
+            r = call("gradereport_user_get_grade_items", courseid=c["id"], userid=uid)
+        except (TokenError, NetworkError):
+            raise
+        except MoodleError as e:
+            log("  note: no grades for %s (%s)" % (c.get("shortname"), e))
+            return []
+        return [(c, g) for ug in r.get("usergrades") or [] for g in ug.get("gradeitems") or []]
+
+    if not cs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(cs))) as ex:
+        pairs = [p for lst in ex.map(one, cs) for p in lst]
+    since = now_ts() - days * DAY
+    out = []
+    for c, g in pairs:
+        if g.get("itemtype") in ("course", "category") or not is_graded(g) or g.get("gradeishidden"):
+            continue
+        ts = int(g.get("gradedategraded") or g.get("gradedatesubmitted") or 0)
+        if not everything and ts < since:
+            continue
+        module, cmid = g.get("itemmodule") or None, g.get("cmid") or None
+        out.append({
+            "course": c.get("shortname") or c.get("fullname"),
+            "subject": c["subject"],
+            "name": plain(g.get("itemname")) or "?",
+            "module": module,
+            "cmid": cmid,
+            "grade": plain(g.get("gradeformatted")) or None,
+            "range": plain(g.get("rangeformatted")) or None,
+            "percentage": plain(g.get("percentageformatted")) or None,
+            "graded": iso(ts),
+            "graded_ts": ts,
+            "feedback": text_of(g.get("feedback")) if g.get("feedbackformat") in (0, 1, None) else plain(g.get("feedback")),
+            "url": "%s/mod/%s/view.php?id=%d" % (SITE, module, cmid) if module and cmid else None,
+        })
+    out.sort(key=lambda x: (-x["graded_ts"], x["course"] or "", x["name"]))
+    return out
+
+
+def cmd_grades(a):
+    items = grade_items(a.days, a.all)
+    if a.json:
+        print(json.dumps({"schema": GRADES_SCHEMA, "site": SITE, "generated": iso(int(now_ts())),
+                          "timezone": str(TZ or "local"), "days": None if a.all else a.days, "items": items},
+                         ensure_ascii=False, indent=1))
+        return
+    if not items:
+        print("No new grades in the last %d days." % a.days if not a.all else "No grades yet.")
+        return
+    for x in items:
+        grade = x["grade"] or ""
+        if x["range"] and "/" not in grade:
+            grade += " / %s" % x["range"].split("–")[-1].split("-")[-1].strip()
+        if x["percentage"] and x["percentage"] != "-":
+            grade += " (%s)" % x["percentage"]
+        fb = (x["feedback"] or "").split("\n")[0]
+        print("%-6s %-5s %-40s %s%s" % (local(x["graded_ts"]).strftime("%d.%m.") if x["graded_ts"] else "",
+                                         x["subject"] or "?", x["name"][:40], grade,
+                                         "  " + (fb[:70] + "…" if len(fb) > 70 else fb) if fb else ""))
+
+
+SCHEMAS = {"due": DUE_SCHEMA, "grades": GRADES_SCHEMA}
+
+
+# ---- doctor ---------------------------------------------------------------------------------------------------
+
+CONFIG_KEYS = {"notes", "files", "timezone", "max_download_mb"}
+NEEDED = {                                                      # web-service function -> what needs it
+    "core_enrol_get_users_courses": "everything", "mod_assign_get_assignments": "list/show/add/sync",
+    "mod_assign_get_submission_status": "submission status", "core_calendar_get_action_events_by_timesort": "due",
+    "gradereport_user_get_grade_items": "grades",
+}
+
+
+def token_source():
+    """(where the token comes from, problem or None). Never reads it out."""
+    if os.environ.get("MOODLE_TOKEN", "").strip():
+        return "MOODLE_TOKEN", None
+    if os.environ.get("MOODLE_TOKEN_CMD"):
+        return "MOODLE_TOKEN_CMD", None
+    try:
+        st = os.stat(TOKEN_FILE)
+    except OSError:
+        return TOKEN_FILE, "missing: run `moodle token`"
+    if st.st_mode & 0o077:
+        return TOKEN_FILE, "readable by others: chmod 600 %s" % TOKEN_FILE
+    return TOKEN_FILE, None
+
+
+def cmd_doctor(a):
+    """Check config, token and site without printing the token. Exit 1 if anything FAILs."""
+    bad = []
+
+    def say(level, msg):
+        print("%-4s %s" % (level, redact(msg)))
+        if level == "FAIL":
+            bad.append(msg)
+
+    say("ok" if sys.version_info >= (3, 11) else "FAIL", "Python %d.%d" % sys.version_info[:2])
+    cfg = os.path.join(CONF, "config.toml")
+    if os.path.exists(cfg):
+        unknown = sorted(set(CONFIG) - CONFIG_KEYS)
+        say("warn" if unknown else "ok", "config %s%s" % (cfg, " (unknown keys: %s)" % ", ".join(unknown) if unknown else ""))
+    else:
+        say("warn", "no %s: notes and files go to the defaults" % cfg)
+    for label, d in (("notes", NOTES), ("files", FILES)):
+        say("ok" if os.path.isdir(d) else "warn", "%s folder %s%s" % (label, d, "" if os.path.isdir(d) else " (missing)"))
+    say("ok" if TZ else "warn", "time zone %s" % (TZ or "of this machine"))
+    where, problem = token_source()
+    say("FAIL" if problem and "missing" in problem else ("warn" if problem else "ok"),
+        "token from %s%s" % (where, ": " + problem if problem else ""))
+    if problem and "missing" in problem:
+        sys.exit(EXIT_TOKEN)
+    try:
+        tok = read_token()
+        if not re.fullmatch(r"[0-9a-f]{32}", tok):
+            say("warn", "the token doesn't look like Moodle's usual 32 hex characters")
+        info = site_info()
+    except MoodleError as e:
+        say("FAIL", "%s: %s" % (SITE, e))
+        sys.exit(e.exit_code)
+    say("ok", "%s: %s, Moodle %s, logged in as %s" % (SITE, info.get("sitename"), (info.get("release") or "?").split(" ")[0],
+                                                     info.get("username")))
+    have = {f.get("name") for f in info.get("functions") or []}
+    for fn, use in NEEDED.items():
+        if have and fn not in have:
+            say("warn", "the site doesn't offer %s (needed for %s)" % (fn, use))
+    try:
+        cs = courses()
+    except MoodleError as e:
+        say("FAIL", "courses: %s" % e)
+        sys.exit(e.exit_code)
+    unmapped = [c.get("shortname") or c.get("fullname") for c in cs if not c["subject"]]
+    say("warn" if unmapped else "ok", "%d current courses%s" % (
+        len(cs), "; no subject for: %s (add to %s)" % (", ".join(unmapped), SUBJECTS_FILE) if unmapped else ""))
+    if bad:
+        sys.exit(EXIT_ERROR)
+
+
+def cmd_due(a):
+    n = int(now_ts())
+    items = due_items(a.days, a.past, a.all)
+    if a.json:
+        print(json.dumps({
+            "schema": DUE_SCHEMA, "site": SITE, "generated": iso(n), "timezone": str(TZ or "local"),
+            "from": iso(n - a.past * DAY), "to": iso(n + a.days * DAY), "items": items,
+        }, ensure_ascii=False, indent=1))
+        return
+    late = sum(x["overdue"] for x in items)
+    if not items:
+        print("Nothing due in the next %d days." % a.days)
+        return
+    print("%d due in the next %d days%s:" % (len(items) - late, a.days, ", %d overdue" % late if late else ""))
+    for x in items:
+        print("%-8s %s  %-5s %s%s" % ("OVERDUE" if x["overdue"] else "", local(x["due_ts"]).strftime("%a %d.%m. %H:%M"),
+                                     x["subject"] or "?", x["name"], "  (%s)" % x["action"] if x["action"] else ""))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="moodle", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1185,6 +1742,18 @@ def main():
     s.add_argument("--dated", action="store_true", help="only assignments with a due date")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("due", help="what still needs doing, by deadline (the app's timeline); --json for scripts")
+    s.add_argument("--days", type=int, default=14, metavar="N", help="days ahead (default 14)")
+    s.add_argument("--past", type=int, default=14, metavar="N", help="overdue items from the last N days (default 14)")
+    s.add_argument("--all", action="store_true", help="include grade slots and admin pages")
+    s.add_argument("--json", action="store_true", help="stable JSON (schema moodle-due/1)")
+    s.set_defaults(fn=cmd_due)
+    s = sub.add_parser("grades", help="recent grades and feedback")
+    s.add_argument("--days", type=int, default=30, metavar="N", help="graded in the last N days (default 30)")
+    s.add_argument("--all", action="store_true", help="every grade of the current courses")
+    s.add_argument("--json", action="store_true", help="stable JSON (schema moodle-grades/1)")
+    s.set_defaults(fn=cmd_grades)
+    sub.add_parser("doctor", help="check config, token and site (never prints the token)").set_defaults(fn=cmd_doctor)
     s = sub.add_parser("show", help="one assignment in full")
     s.add_argument("assignment", help="link like …/mod/assign/view.php?id=25720, or the id")
     s.add_argument("--json", action="store_true")
@@ -1203,9 +1772,17 @@ def main():
     try:
         a.fn(a)
     except MoodleError as e:
-        fail(str(e))
+        if getattr(a, "json", False):                           # scripts get the error as JSON on stdout too
+            err = {"error": {"code": e.code, "message": str(e)}}
+            print(json.dumps(dict({"schema": SCHEMAS[a.cmd]} if a.cmd in SCHEMAS else {}, **err), ensure_ascii=False))
+        fail(str(e), e.exit_code)
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception as e:                                      # a bug: say what, but never with the token in it
+        if os.environ.get("MOODLE_DEBUG"):
+            import traceback
+            log(traceback.format_exc())
+        fail("unexpected %s: %s" % (type(e).__name__, e))
 
 
 if __name__ == "__main__":
