@@ -61,6 +61,21 @@ class Due(MoodleCase):
         self.assertEqual(len(self.fake.calls_to("core_calendar_get_action_events_by_timesort")), 3)
         self.assertEqual(len({x["id"] for x in d["items"]}), 120)
 
+    def test_a_server_that_repeats_a_page_is_not_asked_forever(self):
+        sew = self.fake.events[1]["course"]
+        self.fake.events = [event(100 + i, 6000 + i, "Item %03d" % i, NOW + 3600 * i, sew) for i in range(50)]
+        calls = []
+
+        def stuck(fn, p, _orig=self.fake.answer):
+            if fn == "core_calendar_get_action_events_by_timesort":
+                calls.append(p)
+                return _orig(fn, dict(p, aftereventid=0))           # always the first page again
+            return _orig(fn, p)
+        self.fake.answer = stuck
+        d = self.due_json("--days", "10")
+        self.assertEqual(len(d["items"]), 50)
+        self.assertEqual(len(calls), 2)
+
     def test_nothing(self):
         self.fake.events = []
         _, out, _ = self.run_cli("due", "--days", "3")

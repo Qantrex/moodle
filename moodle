@@ -1511,15 +1511,17 @@ def plain(s):
 
 def action_events(frm, to):
     """Everything with a deadline that still needs doing (the Moodle app's timeline), all pages of it."""
-    out, after = [], 0
+    out, after, seen = [], 0, set()
     for _ in range(40):
         args = dict(timesortfrom=frm, timesortto=to, limitnum=EVENTS_PAGE)
         if after:
             args["aftereventid"] = after
         page = (call("core_calendar_get_action_events_by_timesort", **args) or {}).get("events") or []
-        out += page
-        if len(page) < EVENTS_PAGE:
-            break
+        fresh = [e for e in page if e.get("id") not in seen]
+        seen.update(e.get("id") for e in page)
+        out += fresh
+        if len(page) < EVENTS_PAGE or not fresh or page[-1].get("id") == after:
+            break                                               # last page, or a server that repeats itself
         after = page[-1]["id"]
     return out
 
