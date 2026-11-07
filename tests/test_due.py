@@ -76,6 +76,11 @@ class Due(MoodleCase):
         self.assertEqual(len(d["items"]), 50)
         self.assertEqual(len(calls), 2)
 
+    def test_an_event_without_url_uses_its_action_link(self):
+        del self.fake.events[0]["url"]
+        x = self.due_json()["items"][0]
+        self.assertEqual((x["cmid"], x["url"]), (2001, SITE + "/mod/assign/view.php?id=2001&action=editsubmission"))
+
     def test_nothing(self):
         self.fake.events = []
         _, out, _ = self.run_cli("due", "--days", "3")

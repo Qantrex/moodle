@@ -1530,16 +1530,17 @@ def due_items(days=14, past=14, everything=False):
     n = int(now_ts())
     items, seen = [], set()
     for e in action_events(n - past * DAY, n + days * DAY):
-        if e.get("id") in seen:
-            continue
-        seen.add(e.get("id"))
+        if e.get("id") is not None:
+            if e["id"] in seen:
+                continue
+            seen.add(e["id"])
         c = e.get("course") or {}
         name = plain(e.get("activityname") or e.get("name"))
         if not everything and PLACEHOLDER.search(name):
             continue
         ts = int(e.get("timesort") or 0)
         act = e.get("action") or {}
-        url = e.get("url") or ""
+        url = e.get("url") or act.get("url") or ""             # some events only carry the action's link
         cm = re.search(r"[?&]id=(\d+)", url)
         items.append({
             "id": e.get("id"),
