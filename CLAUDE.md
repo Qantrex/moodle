@@ -34,4 +34,4 @@ token shows up in any output. Add a test with every fix. CI (`.github/workflows/
 ## Style
 
 Short plain-English messages, small logical commits (`FIX:`, `FEAT:`, `TEST:`, `PERF:`, `DOCS:` prefixes).
-AI attribution (Co-Authored-By) only on major reworks, not on small fixes.
+No AI attribution (Co-Authored-By) in commits: the repo is public.
